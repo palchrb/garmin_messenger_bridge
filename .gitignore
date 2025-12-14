@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+state/*
+!state/.gitkeep
+data/
+garmin.env
+.env

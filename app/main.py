@@ -65,6 +65,11 @@ def main():
         log("Weak or missing PROVISION_SECRET — set a strong value!", level="ERROR", debug_enabled=True)
 
     os.makedirs(cfg.state_dir, exist_ok=True)
+    log(
+        f"Resolved paths: db={cfg.db_path} root_dir={cfg.root_dir} state_dir={cfg.state_dir} subs_db={cfg.subs_db} adb_target={cfg.adb_target}",
+        level="INFO",
+        debug_enabled=True,
+    )
 
     state = StateStore(cfg.subs_db)
 

@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   redroid13:
     image: redroid/redroid:13.0.0_mindthegapps

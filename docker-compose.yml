@@ -1,15 +1,13 @@
-version: "3.9"
-
 services:
-  redroid:
-    image: ${REDROID_IMAGE:-redroid/redroid:13.0.0_mindthegapps}
-    container_name: ${REDROID_SERVICE:-redroid13}
+  redroid13:
+    image: redroid/redroid:13.0.0_mindthegapps
+    container_name: redroid13
     privileged: true
     restart: unless-stopped
     ports:
       - "127.0.0.1:5555:5555"
-      - "100.69.220.60:5555:5555"
-      - "100.69.220.60:5900:5900"
+      - "tailnet-ip:5555:5555"
+      - "tailnet-ip:5900:5900"
     devices:
       - "/dev/binder:/dev/binder"
       - "/dev/hwbinder:/dev/hwbinder"
@@ -33,16 +31,14 @@ services:
     container_name: garmin-bridge
     restart: unless-stopped
     depends_on:
-      - redroid
+      - redroid13
     ports:
-      - "100.69.220.60:8788:8788"
+      - "tailnet-ip:8788:8788"
     volumes:
       - ./data:/android-data:ro
       - ./state:/var/lib/garmin-bridge
     env_file:
       - ./garmin.env
     environment:
-      # Keep ADB_TARGET in sync with the Redroid service name/image above. If you
-      # already set this in garmin.env, you can drop this override.
-      - ADB_TARGET=${ADB_TARGET:-${REDROID_SERVICE:-redroid13}:5555}
-      - STATE_DIR=${STATE_DIR:-/var/lib/garmin-bridge}
+      - ADB_TARGET=redroid13:5555
+      - STATE_DIR=/var/lib/garmin-bridge

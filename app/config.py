@@ -36,12 +36,6 @@ def _env_csv(name: str, default: str) -> List[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
-def _default_adb_target() -> str:
-    # Let REDROID_SERVICE influence the default so compose overrides stay in sync.
-    redroid_service = os.environ.get("REDROID_SERVICE", "redroid13")
-    return f"{redroid_service}:5555"
-
-
 @dataclass
 class Config:
     # General
@@ -62,9 +56,7 @@ class Config:
     )
 
     # State store
-    state_dir: str = field(
-        default_factory=lambda: _env("STATE_DIR", "/var/lib/garmin-bridge")
-    )
+    state_dir: str = field(default_factory=lambda: _env("STATE_DIR", "./state"))
     subs_db: str = field(default_factory=lambda: _env("SUBS_DB", ""))
 
     # Provision / outbound control API (Maubot -> bridge)
@@ -76,7 +68,7 @@ class Config:
 
     # ADB
     adb_path: str = field(default_factory=lambda: _env("ADB_PATH", "adb"))
-    adb_target: str = field(default_factory=lambda: _env("ADB_TARGET", _default_adb_target()))
+    adb_target: str = field(default_factory=lambda: _env("ADB_TARGET", "redroid13:5555"))
     adb_connect_retries: int = field(default_factory=lambda: _env_int("ADB_CONNECT_RETRIES", 30))
     adb_connect_backoff_sec: float = field(default_factory=lambda: _env_float("ADB_CONNECT_BACKOFF_SEC", 1.0))
     adb_cmd_timeout_sec: float = field(default_factory=lambda: _env_float("ADB_CMD_TIMEOUT_SEC", 15.0))

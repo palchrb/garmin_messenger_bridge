@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
-from .config import CFG
+from .config import Config
 from .logutil import get_logger
 
 log = get_logger(__name__)
@@ -52,9 +52,10 @@ class AdbClient:
         target: Optional[str] = None,
         cmd_timeout_sec: Optional[float] = None,
     ) -> None:
-        self.adb_path = adb_path or CFG.ADB_PATH
-        self.target = target or CFG.ADB_TARGET
-        self.cmd_timeout_sec = float(cmd_timeout_sec or CFG.ADB_CMD_TIMEOUT_SEC)
+        cfg = Config()
+        self.adb_path = adb_path or cfg.adb_path
+        self.target = target or cfg.adb_target
+        self.cmd_timeout_sec = float(cmd_timeout_sec or cfg.adb_cmd_timeout_sec)
 
     def ensure_connected(self) -> None:
         """
@@ -62,8 +63,9 @@ class AdbClient:
         Retries with backoff to survive restarts of redroid container.
         """
         last: str = ""
-        retries = max(1, int(CFG.ADB_CONNECT_RETRIES))
-        backoff = float(CFG.ADB_CONNECT_BACKOFF_SEC)
+        cfg = Config()
+        retries = max(1, int(cfg.adb_connect_retries))
+        backoff = float(cfg.adb_connect_backoff_sec)
 
         for i in range(retries):
             p = _run([self.adb_path, "connect", self.target], timeout=self.cmd_timeout_sec)

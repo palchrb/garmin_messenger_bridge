@@ -3,34 +3,53 @@ import signal
 import sys
 import threading
 import time
+from typing import Any, Dict, Tuple
 
+from .adb import AdbClient
 from .config import Config
+from .garmin_ui import GarminUI
 from .logutil import log
-from .state_store import StateStore
 from .provision_server import ProvisionServer
+from .state_store import StateStore
 from .watcher import Watcher
-from .adb import ADBManager
 
 
 class OutboundHandler:
-    """
-    Placeholder. Wire in your existing 'working ADB/UIAutomator calls' here.
-    Maubot will call /send_text and /send_media on the bridge.
-    """
-    def __init__(self, adb: ADBManager, debug: bool):
-        self.adb = adb
+    """Adapter that drives GarminUI for outbound sends."""
+
+    def __init__(self, garmin_ui: GarminUI, debug: bool):
+        self.garmin_ui = garmin_ui
         self.debug = debug
 
-    def send_text(self, payload):
-        # TODO: implement with your known-good ADB/uiautomator routines
-        # Expected payload example:
-        # {"conversation_id":"...", "text":"...", "sender":"@me:server", "meta": {...}}
+    def send_text(self, payload: Dict[str, Any]) -> Tuple[bool, str]:
         log(f"[OUTBOUND] send_text payload={payload}", level="INFO", debug_enabled=self.debug)
-        return True, "queued/ok (stub)"
+        msg = (payload.get("msg") or payload.get("text") or "").strip()
+        if not msg:
+            return False, "missing msg"
 
-    def send_media(self, payload):
+        try:
+            if "thread_id" in payload and payload.get("thread_id") is not None:
+                thread_id = int(payload.get("thread_id"))
+                self.garmin_ui.send_to_thread(thread_id=thread_id, msg=msg)
+                return True, "sent"
+
+            recipients = payload.get("recipients")
+            if isinstance(recipients, list) and recipients:
+                cleaned = [str(r).strip() for r in recipients if str(r).strip()]
+                if not cleaned:
+                    return False, "empty recipients"
+                self.garmin_ui.start_thread_and_send(recipients=cleaned, msg=msg)
+                return True, "sent"
+        except Exception as e:  # pragma: no cover - ADB/Runtime failures
+            log(f"[OUTBOUND] send_text failed: {e}", level="ERROR", debug_enabled=self.debug)
+            return False, str(e)
+
+        return False, "missing thread_id or recipients"
+
+    def send_media(self, payload: Dict[str, Any]) -> Tuple[bool, str]:
+        # Media sending not yet implemented; log and fail gracefully.
         log(f"[OUTBOUND] send_media payload={payload}", level="INFO", debug_enabled=self.debug)
-        return True, "queued/ok (stub)"
+        return False, "send_media not implemented"
 
 
 def main():
@@ -47,18 +66,14 @@ def main():
 
     os.makedirs(cfg.state_dir, exist_ok=True)
 
-    state = StateStore(cfg.resolved_subs_json(), cfg.resolved_seen_file())
+    state = StateStore(cfg.subs_db)
 
     stop_evt = threading.Event()
 
-    # ADB keepalive
-    adb = ADBManager(adb_target=cfg.adb_target, keepalive_sec=cfg.adb_keepalive_sec, debug=cfg.debug)
-    adb_thread = threading.Thread(target=adb.keepalive_loop, args=(stop_evt,), daemon=True)
-    adb_thread.start()
+    adb = AdbClient(adb_path=cfg.adb_path, target=cfg.adb_target, cmd_timeout_sec=cfg.adb_cmd_timeout_sec)
+    garmin_ui = GarminUI(adb)
+    outbound = OutboundHandler(garmin_ui, cfg.debug)
 
-    outbound = OutboundHandler(adb, cfg.debug)
-
-    # Provision server
     server = ProvisionServer(
         cfg.bind,
         cfg.port,
@@ -66,19 +81,17 @@ def main():
         hmac_secret=cfg.hmac_secret,
         allowlist=cfg.allowlist,
         debug=cfg.debug,
-        state_store=state,
         outbound_handler=outbound,
     )
     httpd = server.start()
     http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     http_thread.start()
 
-    # Watcher loop
     watcher = Watcher(cfg=cfg, state=state)
     watch_thread = threading.Thread(target=watcher.loop, args=(stop_evt,), daemon=True)
     watch_thread.start()
 
-    def _sig(signum, frame):
+    def _sig(signum, frame):  # pragma: no cover - signal handler
         log(f"Signal {signum} → shutting down", level="INFO", debug_enabled=True)
         stop_evt.set()
         try:

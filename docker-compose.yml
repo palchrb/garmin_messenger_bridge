@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  redroid13:
+    image: redroid/redroid:13.0.0_mindthegapps
+    container_name: redroid13
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5555:5555"
+      - "100.69.220.60:5555:5555"
+      - "100.69.220.60:5900:5900"
+    devices:
+      - "/dev/binder:/dev/binder"
+      - "/dev/hwbinder:/dev/hwbinder"
+      - "/dev/vndbinder:/dev/vndbinder"
+    volumes:
+      - ./data:/data
+    shm_size: "2g"
+    command: >
+      androidboot.redroid_width=1080
+      androidboot.redroid_height=1920
+      androidboot.redroid_dpi=480
+      androidboot.redroid_fps=60
+      androidboot.redroid_gpu_mode=guest
+      androidboot.use_memfd=true
+      ro.setupwizard.mode=DISABLED
+
+  garmin-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: garmin-bridge
+    restart: unless-stopped
+    depends_on:
+      - redroid13
+    ports:
+      - "100.69.220.60:8788:8788"
+    volumes:
+      - ./data:/android-data:ro
+      - ./state:/var/lib/garmin-bridge
+    env_file:
+      - ./garmin.env
+    environment:
+      - ADB_TARGET=redroid13:5555
+      - STATE_DIR=/var/lib/garmin-bridge

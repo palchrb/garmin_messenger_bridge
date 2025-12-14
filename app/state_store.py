@@ -1,154 +1,187 @@
-import json
 import os
+import sqlite3
 import threading
 import time
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
 
 
 class StateStore:
-    def __init__(self, subs_path: str, seen_path: str):
-        self.subs_path = subs_path
-        self.seen_path = seen_path
-        self._sub_lock = threading.Lock()
-        self._seen_lock = threading.Lock()
-        self._seen = set()
-        os.makedirs(os.path.dirname(self.subs_path), exist_ok=True)
-        os.makedirs(os.path.dirname(self.seen_path), exist_ok=True)
-        self._load_seen()
+    """SQLite-backed state for subscriptions and deduplication."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._lock = threading.Lock()
+        self._init_db()
+
+    # ---------------- internal helpers ----------------
+    def _conn(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.db_path, timeout=5.0, isolation_level=None, check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        return con
+
+    def _init_db(self) -> None:
+        with self._conn() as con:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subs (
+                    msisdn TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    verify_code TEXT,
+                    webhook_url TEXT,
+                    bearer_token TEXT,
+                    created_ts INTEGER,
+                    updated_ts INTEGER,
+                    PRIMARY KEY (msisdn, name)
+                );
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seen (
+                    key TEXT PRIMARY KEY,
+                    created_ts INTEGER
+                );
+                """
+            )
 
     # ---------------- subs ----------------
-    def _load_subs(self) -> Dict[str, Any]:
-        if not os.path.isfile(self.subs_path):
-            return {}
-        try:
-            with open(self.subs_path, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-        except Exception:
-            return {}
-
-    def _save_subs(self, d: Dict[str, Any]) -> None:
-        tmp = self.subs_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.subs_path)
-
     def subs_get(self, msisdn: str) -> Dict[str, Any]:
-        with self._sub_lock:
-            subs = self._load_subs()
-            return subs.get(msisdn) or {}
+        with self._lock, self._conn() as con:
+            cur = con.execute(
+                "SELECT name, status, verify_code, webhook_url, bearer_token, created_ts, updated_ts FROM subs WHERE msisdn=?",
+                (msisdn,),
+            )
+            res = {}
+            for row in cur.fetchall():
+                name, status, verify_code, webhook_url, bearer_token, created_ts, updated_ts = row
+                res[name] = {
+                    "name": name,
+                    "status": status,
+                    "verify_code": verify_code or "",
+                    "webhook_url": webhook_url or "",
+                    "bearer_token": bearer_token or "",
+                    "created_ts": int(created_ts or 0),
+                    "updated_ts": int(updated_ts or 0),
+                }
+            return res
 
     def subs_set(self, msisdn: str, name: str, status: str, verify_code: str, url: str, token: str) -> None:
         now = int(time.time())
         nkey = (name or "").lower()
-        with self._sub_lock:
-            subs = self._load_subs()
-            ms = subs.get(msisdn) or {}
-            row = ms.get(nkey) or {"name": name, "created_ts": now}
-            row.update(
-                {
-                    "name": name,
-                    "status": status,
-                    "verify_code": str(verify_code or ""),
-                    "webhook_url": url,
-                    "bearer_token": token,
-                    "updated_ts": now,
-                }
+        with self._lock, self._conn() as con:
+            cur = con.execute(
+                "SELECT created_ts FROM subs WHERE msisdn=? AND name=?", (msisdn, nkey)
             )
-            ms[nkey] = row
-            subs[msisdn] = ms
-            self._save_subs(subs)
+            row = cur.fetchone()
+            created_ts = int(row[0]) if row else now
+            con.execute(
+                """
+                INSERT INTO subs (msisdn, name, status, verify_code, webhook_url, bearer_token, created_ts, updated_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(msisdn, name) DO UPDATE SET
+                    status=excluded.status,
+                    verify_code=excluded.verify_code,
+                    webhook_url=excluded.webhook_url,
+                    bearer_token=excluded.bearer_token,
+                    updated_ts=excluded.updated_ts
+                """,
+                (msisdn, nkey, status, str(verify_code or ""), url, token, created_ts, now),
+            )
 
     def subs_check_name_exists(self, msisdn: str, name: str) -> bool:
-        return (name or "").lower() in self.subs_get(msisdn)
+        nkey = (name or "").lower()
+        with self._lock, self._conn() as con:
+            cur = con.execute("SELECT 1 FROM subs WHERE msisdn=? AND name=?", (msisdn, nkey))
+            return cur.fetchone() is not None
 
     def subs_activate_if_code(self, msisdn: str, name: str, code: str) -> bool:
         nkey = (name or "").lower()
-        with self._sub_lock:
-            subs = self._load_subs()
-            ms = subs.get(msisdn) or {}
-            row = ms.get(nkey)
-            if not row:
+        with self._lock, self._conn() as con:
+            cur = con.execute(
+                "SELECT verify_code FROM subs WHERE msisdn=? AND name=?", (msisdn, nkey)
+            )
+            row = cur.fetchone()
+            if not row or str(row[0] or "") != str(code):
                 return False
-            if str(row.get("verify_code", "")) != str(code):
-                return False
-            row["status"] = "active"
-            row["updated_ts"] = int(time.time())
-            ms[nkey] = row
-            subs[msisdn] = ms
-            self._save_subs(subs)
+            now = int(time.time())
+            con.execute(
+                "UPDATE subs SET status='active', updated_ts=? WHERE msisdn=? AND name=?",
+                (now, msisdn, nkey),
+            )
         return True
 
     def subs_deactivate(self, msisdn: str, name: Optional[str] = None) -> None:
-        with self._sub_lock:
-            subs = self._load_subs()
-            ms = subs.get(msisdn) or {}
-            changed = False
+        now = int(time.time())
+        with self._lock, self._conn() as con:
             if name:
                 nkey = name.lower()
-                if nkey in ms:
-                    ms[nkey]["status"] = "inactive"
-                    ms[nkey]["updated_ts"] = int(time.time())
-                    changed = True
+                con.execute(
+                    "UPDATE subs SET status='inactive', updated_ts=? WHERE msisdn=? AND name=?",
+                    (now, msisdn, nkey),
+                )
             else:
-                for k in list(ms.keys()):
-                    ms[k]["status"] = "inactive"
-                    ms[k]["updated_ts"] = int(time.time())
-                    changed = True
-            if changed:
-                subs[msisdn] = ms
-                self._save_subs(subs)
+                con.execute(
+                    "UPDATE subs SET status='inactive', updated_ts=? WHERE msisdn=?",
+                    (now, msisdn),
+                )
 
     def subs_rotate_token(self, msisdn: str, name: str, bearer_token: str, webhook_url: Optional[str] = None) -> bool:
-        now = int(time.time())
-        nkey = (name or "").lower()
-        if not msisdn or not nkey or not bearer_token:
+        if not msisdn or not name or not bearer_token:
             return False
-        with self._sub_lock:
-            subs = self._load_subs()
-            ms = subs.get(msisdn) or {}
-            row = ms.get(nkey)
-            if not row:
+        now = int(time.time())
+        nkey = name.lower()
+        with self._lock, self._conn() as con:
+            cur = con.execute("SELECT 1 FROM subs WHERE msisdn=? AND name=?", (msisdn, nkey))
+            if cur.fetchone() is None:
                 return False
-            row["bearer_token"] = bearer_token
-            if webhook_url:
-                row["webhook_url"] = webhook_url
-            row["updated_ts"] = now
-            ms[nkey] = row
-            subs[msisdn] = ms
-            self._save_subs(subs)
+            con.execute(
+                """
+                UPDATE subs
+                SET bearer_token=?, webhook_url=COALESCE(?, webhook_url), updated_ts=?
+                WHERE msisdn=? AND name=?
+                """,
+                (bearer_token, webhook_url, now, msisdn, nkey),
+            )
         return True
 
     def active_targets(self, msisdn: str) -> List[Dict[str, Any]]:
-        ms = self.subs_get(msisdn)
-        return [v for v in ms.values() if v.get("status") == "active"]
+        with self._lock, self._conn() as con:
+            cur = con.execute(
+                """
+                SELECT name, status, webhook_url, bearer_token, created_ts, updated_ts
+                FROM subs
+                WHERE msisdn=? AND status='active'
+                """,
+                (msisdn,),
+            )
+            out = []
+            for name, status, webhook_url, bearer_token, created_ts, updated_ts in cur.fetchall():
+                out.append(
+                    {
+                        "name": name,
+                        "status": status,
+                        "webhook_url": webhook_url or "",
+                        "bearer_token": bearer_token or "",
+                        "created_ts": int(created_ts or 0),
+                        "updated_ts": int(updated_ts or 0),
+                    }
+                )
+            return out
 
     # ---------------- seen ----------------
-    def _load_seen(self) -> None:
-        if not os.path.isfile(self.seen_path):
-            return
-        try:
-            with open(self.seen_path, "r", encoding="utf-8") as f:
-                self._seen = set(x.strip() for x in f if x.strip())
-        except Exception:
-            self._seen = set()
-
     def is_seen(self, key: str) -> bool:
-        with self._seen_lock:
-            return key in self._seen
+        with self._lock, self._conn() as con:
+            cur = con.execute("SELECT 1 FROM seen WHERE key=?", (key,))
+            return cur.fetchone() is not None
 
     def add_seen(self, key: str) -> None:
-        with self._seen_lock:
-            if key in self._seen:
-                return
-            self._seen.add(key)
-            with open(self.seen_path, "a", encoding="utf-8") as f:
-                f.write(key + "\n")
-            # trim if huge
-            try:
-                if os.path.getsize(self.seen_path) > 1024 * 1024:
-                    with open(self.seen_path, "r", encoding="utf-8") as f2:
-                        lines = list(f2)[-5000:]
-                    with open(self.seen_path, "w", encoding="utf-8") as f3:
-                        f3.writelines(lines)
-            except Exception:
-                pass
+        now = int(time.time())
+        with self._lock, self._conn() as con:
+            con.execute(
+                "INSERT OR IGNORE INTO seen (key, created_ts) VALUES (?, ?)",
+                (key, now),
+            )
+

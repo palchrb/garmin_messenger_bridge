@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
-"""
-Garmin Messenger ↔ Matrix (Maubot) bridge.
+"""Garmin Messenger ↔ Matrix (Maubot) bridge.
 
-Key invariants (based on Garmin Messenger message.db schema):
-- Canonical conversation identifier is message.internet_conversation_id (UUID-like text).
-- Local thread id message.message_thread_id is an ephemeral integer row id (may change across logins).
-- Canonical per-message identifier is message.ota_uuid when present (unique index exists for non-NULL values).
-- Inbound ingestion must handle BOTH directions:
-    origin=1 => remote inbound to this account
-    origin=0 => sent from this account (either echo of Matrix->Garmin, or manual send in Garmin app)
-- Echo suppression: Matrix->Garmin sends are correlated to ota_uuid once they appear in DB; later poller
-  treats those outgoing messages as "echo" and does not forward them back to Matrix.
+Implements:
+1) Auto-ACK on successful forward to Maubot (2xx).
+2) Pending media re-scan (attachments can appear on disk after DB row is visible).
+3) Deterministic outbound correlation:
+   - Uses built-in ADB/UIAutomator flows.
+   - After the ADB flow completes, polls message.db for the new outgoing message and captures ota_uuid.
+   - Stores ota_uuid↔(matrix room,event) for echo suppression.
+   - For new_thread creation, also discovers the new internet_conversation_id and reports it.
 
-This bridge:
-- Polls Garmin's SQLite DB (read-only) for new messages (text + attachments).
-- Resolves media files robustly:
-    1) Prefer media_attachment_file table rows (if present) to get concrete file paths.
-    2) Fallback to deterministic disk scan by attachment_id across common subfolders and extensions.
-- Forwards inbound events to Maubot via HTTP webhook.
-- Exposes a small HTTP API for Maubot to:
-    - link a Garmin conversation UUID to a Matrix room
-    - enqueue outbound sends (text/media)
-    - acknowledge deliveries (idempotency)
+4) Built-in ADB/UIAutomator flows:
+   - Send to existing thread via inreach://messageThread/<THREAD_ID>
+   - Compose new thread via inreach://composedevicemessage/ (recipients + first message)
 
-Outbound sending (Garmin UI automation):
-- This file intentionally does NOT hardcode device-specific ADB/UIAutomator sequences.
-- Instead, it invokes an external command (GARMIN_SEND_CMD) with a JSON payload; you provide that
-  sender implementation (e.g., your robust adb/uiautomator scripts).
+Maubot responsibilities:
+- Inbound webhook includes local file paths for attachments; Maubot uploads to Matrix.
+- For existing Garmin chat reply: call /outbound/enqueue with kind=text + internet_conversation_id.
+- For new Garmin chat: call /outbound/enqueue with kind=new_thread + recipients list; bridge returns (best-effort)
+  internet_conversation_id in response and always emits a webhook bridge_outbound_result event.
+
 """
 
 from __future__ import annotations
@@ -41,16 +34,11 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import urllib.request
 
-
-# --------------------------------------------------------------------------------------
-# Env helpers
-# --------------------------------------------------------------------------------------
 
 def env(name: str, default: Any = None, cast: Any = str):
     v = os.environ.get(name, default)
@@ -71,68 +59,61 @@ def env(name: str, default: Any = None, cast: Any = str):
     return v
 
 
-# Required inputs
-DB_PATH = env("DB_PATH")  # Garmin Messenger message.db (bind-mounted from ReDroid or device)
-ROOT_DIR = env("ROOT_DIR")  # Root dir for media files (e.g. .../files/media or exported mirror)
+# ---- Required ----
+DB_PATH = env("DB_PATH")
+ROOT_DIR = env("ROOT_DIR")
 
-# Bridge state (durable, bridge-owned)
+# ---- Bridge state ----
 STATE_DIR = env("STATE_DIR", "/var/lib/garmin-bridge")
 STATE_DB = env("STATE_DB", os.path.join(STATE_DIR, "state.db"))
 
-# Polling
+# ---- Polling ----
 POLL_DB_SEC = env("POLL_DB_SEC", 1, int)
 TAIL_LIMIT = env("TAIL_LIMIT", 250, int)
-DEBUG = env("DEBUG", True, bool)
 LOG_LEVEL = env("LOG_LEVEL", "INFO")
 LOG_JSON = env("LOG_JSON", False, bool)
 
-# Webhook to Maubot
-MAUBOT_WEBHOOK_URL = env("MAUBOT_WEBHOOK_URL")
+# ---- Webhook to Maubot ----
+MAUBOT_WEBHOOK_URL = env("MAUBOT_WEBHOOK_URL", "")
 MAUBOT_WEBHOOK_TOKEN = env("MAUBOT_WEBHOOK_TOKEN", "")
 
-# HTTP API
+# ---- HTTP API ----
 HTTP_BIND = env("HTTP_BIND", "127.0.0.1")
 HTTP_PORT = env("HTTP_PORT", 8808, int)
 HTTP_TOKEN = env("HTTP_TOKEN", "")
 
-# Outbound sender integration
-GARMIN_SEND_CMD = env("GARMIN_SEND_CMD", "")
-GARMIN_SEND_TIMEOUT_SEC = env("GARMIN_SEND_TIMEOUT_SEC", 45, int)
-OUTBOUND_POLL_AFTER_SEND_SEC = env("OUTBOUND_POLL_AFTER_SEND_SEC", 6, int)
-
-# Media constraints
+# ---- Media ----
 MAX_ATTACH_MB = env("MAX_ATTACH_MB", 25, int)
 MEDIA_EXTS = tuple(x.strip() for x in env("MEDIA_EXTS", "avif,jpg,jpeg,png,webp,gif,mp4,m4a,ogg,oga,wav", str).split(",") if x.strip())
-SEARCH_ROOTS = tuple(x.strip() for x in env("SEARCH_ROOTS", "high,preview,low,audio,", str).split(","))
+SEARCH_ROOTS = tuple(x.strip() for x in env("SEARCH_ROOTS", "high,preview,low,audio,", str).split(",") if x is not None)
+
+PENDING_MEDIA_MAX_SEC = env("PENDING_MEDIA_MAX_SEC", 60, int)
+PENDING_MEDIA_RESCAN_SEC = env("PENDING_MEDIA_RESCAN_SEC", 1.0, float)
+PENDING_MEDIA_MAX_ATTEMPTS = env("PENDING_MEDIA_MAX_ATTEMPTS", 30, int)
 
 SQLITE_TIMEOUT = env("SQLITE_TIMEOUT", 2.5, float)
 
+# ---- ADB/UI automation ----
+ADB_BIN = env("ADB_BIN", "adb")
+ADB_SERIAL = env("ADB_SERIAL", "")
+GARMIN_PKG = env("GARMIN_PKG", "com.garmin.android.apps.messenger")
+GARMIN_ACT = env("GARMIN_ACT", ".activity.MainActivity")
 
-# --------------------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------------------
+ADB_DEFAULT_SLEEP = env("ADB_DEFAULT_SLEEP", 0.8, float)
+ADB_COMPOSE_SLEEP = env("ADB_COMPOSE_SLEEP", 1.2, float)
+ADB_DISMISS_BACK_TWICE = env("ADB_DISMISS_BACK_TWICE", True, bool)
+
+# ---- Outbound DB correlation ----
+OUTBOUND_DB_POLL_SEC = env("OUTBOUND_DB_POLL_SEC", 0.5, float)
+OUTBOUND_DB_POLL_MAX_SEC = env("OUTBOUND_DB_POLL_MAX_SEC", 12, int)
+OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC = env("OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC", 8, int)
+
 
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40}
 _CUR_LEVEL = _LEVELS.get(str(LOG_LEVEL).upper(), 20)
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
-
-def log(level: str, msg: str, **fields: Any) -> None:
-    lvl = _LEVELS.get(level.upper(), 20)
-    if lvl < _CUR_LEVEL:
-        return
-
-    if LOG_JSON:
-        payload = {"ts": _now_iso(), "level": level.upper(), "msg": msg}
-        payload.update(fields or {})
-        print(json.dumps(payload, ensure_ascii=False), flush=True)
-        return
-
-    suffix = ""
-    if fields:
-        suffix = " " + " ".join(f"{k}={_safe_kv(v)}" for k, v in fields.items())
-    print(f"{_now_iso()} [{level.upper():5}] {msg}{suffix}", flush=True)
 
 def _safe_kv(v: Any) -> str:
     try:
@@ -141,10 +122,20 @@ def _safe_kv(v: Any) -> str:
     except Exception:
         return "<unprintable>"
 
+def log(level: str, msg: str, **fields: Any) -> None:
+    lvl = _LEVELS.get(level.upper(), 20)
+    if lvl < _CUR_LEVEL:
+        return
+    if LOG_JSON:
+        payload = {"ts": _now_iso(), "level": level.upper(), "msg": msg}
+        payload.update(fields or {})
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        return
+    suffix = ""
+    if fields:
+        suffix = " " + " ".join(f"{k}={_safe_kv(v)}" for k, v in fields.items())
+    print(f"{_now_iso()} [{level.upper():5}] {msg}{suffix}", flush=True)
 
-# --------------------------------------------------------------------------------------
-# SQLite connections
-# --------------------------------------------------------------------------------------
 
 def garmin_db_conn() -> sqlite3.Connection:
     uri = f"file:{DB_PATH}?mode=ro&cache=shared"
@@ -165,17 +156,12 @@ def state_db_conn() -> sqlite3.Connection:
     return con
 
 
-# --------------------------------------------------------------------------------------
-# State schema
-# --------------------------------------------------------------------------------------
-
 STATE_SCHEMA = r"""
 CREATE TABLE IF NOT EXISTS conversation_link (
     internet_conversation_id TEXT NOT NULL PRIMARY KEY,
     matrix_room_id TEXT NOT NULL,
     account_id TEXT,
     participants_json TEXT,
-    last_seen_thread_row_id INTEGER,
     created_ts INTEGER NOT NULL,
     updated_ts INTEGER NOT NULL
 );
@@ -202,15 +188,15 @@ CREATE TABLE IF NOT EXISTS outbound_job (
     matrix_room_id TEXT NOT NULL,
     matrix_event_id TEXT NOT NULL,
     internet_conversation_id TEXT,
-    kind TEXT NOT NULL,
+    kind TEXT NOT NULL,                 -- text | new_thread
     text TEXT,
-    media_path TEXT,
-    media_mime TEXT,
+    recipients_json TEXT,
     created_ts INTEGER NOT NULL,
     updated_ts INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    result_json TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS outbound_unique_event ON outbound_job(matrix_room_id, matrix_event_id);
 
@@ -234,10 +220,6 @@ def init_state() -> None:
         con.commit()
 
 
-# --------------------------------------------------------------------------------------
-# Utilities
-# --------------------------------------------------------------------------------------
-
 def epoch_s(ts: Any) -> Optional[int]:
     if ts is None:
         return None
@@ -258,10 +240,10 @@ def size_mb(path: str) -> float:
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
+def adb_text_escape(s: str) -> str:
+    s = (s or "").replace("\n", " ").replace("\r", " ")
+    return s.replace(" ", "%s")
 
-# --------------------------------------------------------------------------------------
-# Media discovery (robust)
-# --------------------------------------------------------------------------------------
 
 @dataclasses.dataclass(frozen=True)
 class MediaCandidate:
@@ -342,24 +324,16 @@ def resolve_media(con: sqlite3.Connection, root_dir: str, attachment_id: str) ->
     return (best.path if best else None, [c.path for c in all_cands])
 
 
-# --------------------------------------------------------------------------------------
-# Webhook to Maubot
-# --------------------------------------------------------------------------------------
-
-def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int = 15) -> Tuple[int, str]:
+def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int = 20) -> Tuple[int, str]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json; charset=utf-8")
     if bearer:
         req.add_header("Authorization", f"Bearer {bearer}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        b = resp.read(2048)
+        b = resp.read(8192)
         return int(resp.status), b.decode("utf-8", errors="replace")
 
-
-# --------------------------------------------------------------------------------------
-# Cursor helpers
-# --------------------------------------------------------------------------------------
 
 def load_cursor(name: str, default: str = "") -> str:
     with state_db_conn() as con:
@@ -374,10 +348,6 @@ def save_cursor(name: str, value: str) -> None:
         )
         con.commit()
 
-
-# --------------------------------------------------------------------------------------
-# Links and idempotency
-# --------------------------------------------------------------------------------------
 
 def upsert_link(internet_conversation_id: str, matrix_room_id: str, account_id: Optional[str] = None, participants_json: Optional[str] = None) -> None:
     now = int(time.time())
@@ -398,17 +368,7 @@ def upsert_link(internet_conversation_id: str, matrix_room_id: str, account_id: 
 
 def get_link_by_conversation(internet_conversation_id: str) -> Optional[sqlite3.Row]:
     with state_db_conn() as con:
-        return con.execute(
-            "SELECT * FROM conversation_link WHERE internet_conversation_id=? LIMIT 1",
-            (internet_conversation_id,),
-        ).fetchone()
-
-def get_link_by_room(matrix_room_id: str) -> Optional[sqlite3.Row]:
-    with state_db_conn() as con:
-        return con.execute(
-            "SELECT * FROM conversation_link WHERE matrix_room_id=? ORDER BY updated_ts DESC LIMIT 1",
-            (matrix_room_id,),
-        ).fetchone()
+        return con.execute("SELECT * FROM conversation_link WHERE internet_conversation_id=? LIMIT 1", (internet_conversation_id,)).fetchone()
 
 def is_acked(delivery_id: str) -> bool:
     with state_db_conn() as con:
@@ -416,8 +376,9 @@ def is_acked(delivery_id: str) -> bool:
         return bool(r and int(r["acked"] or 0) == 1)
 
 def ack_delivery(delivery_id: str) -> None:
+    now = int(time.time())
     with state_db_conn() as con:
-        con.execute("UPDATE inbound_delivery SET acked=1 WHERE delivery_id=?", (delivery_id,))
+        con.execute("UPDATE inbound_delivery SET acked=1, delivered_ts=? WHERE delivery_id=?", (now, delivery_id))
         con.commit()
 
 def upsert_inbound_record(delivery: Dict[str, Any]) -> None:
@@ -460,7 +421,8 @@ def add_outbound_correlation(ota_uuid: str, matrix_room_id: str, matrix_event_id
     now = int(time.time())
     with state_db_conn() as con:
         con.execute(
-            "INSERT INTO outbound_correlation(ota_uuid, matrix_room_id, matrix_event_id, created_ts) VALUES(?,?,?,?) ON CONFLICT(ota_uuid) DO NOTHING",
+            "INSERT INTO outbound_correlation(ota_uuid, matrix_room_id, matrix_event_id, created_ts) VALUES(?,?,?,?) "
+            "ON CONFLICT(ota_uuid) DO NOTHING",
             (ota_uuid, matrix_room_id, matrix_event_id, now),
         )
         con.commit()
@@ -470,19 +432,15 @@ def lookup_outbound_by_ota(ota_uuid: str) -> Optional[sqlite3.Row]:
         return con.execute("SELECT * FROM outbound_correlation WHERE ota_uuid=? LIMIT 1", (ota_uuid,)).fetchone()
 
 
-# --------------------------------------------------------------------------------------
-# Outbound queue
-# --------------------------------------------------------------------------------------
-
 def enqueue_outbound(job: Dict[str, Any]) -> int:
     now = int(time.time())
     with state_db_conn() as con:
         con.execute(
             """
             INSERT INTO outbound_job(
-              matrix_room_id, matrix_event_id, internet_conversation_id, kind, text, media_path, media_mime,
+              matrix_room_id, matrix_event_id, internet_conversation_id, kind, text, recipients_json,
               created_ts, updated_ts, status, attempts
-            ) VALUES(?,?,?,?,?,?,?,?,?, 'queued', 0)
+            ) VALUES(?,?,?,?,?,?,?,?, 'queued', 0)
             ON CONFLICT(matrix_room_id, matrix_event_id) DO NOTHING
             """,
             (
@@ -491,87 +449,199 @@ def enqueue_outbound(job: Dict[str, Any]) -> int:
                 job.get("internet_conversation_id"),
                 job["kind"],
                 job.get("text"),
-                job.get("media_path"),
-                job.get("media_mime"),
+                job.get("recipients_json"),
                 now,
                 now,
             ),
         )
         con.commit()
-        r = con.execute(
-            "SELECT job_id FROM outbound_job WHERE matrix_room_id=? AND matrix_event_id=? LIMIT 1",
-            (job["matrix_room_id"], job["matrix_event_id"]),
-        ).fetchone()
+        r = con.execute("SELECT job_id FROM outbound_job WHERE matrix_room_id=? AND matrix_event_id=? LIMIT 1", (job["matrix_room_id"], job["matrix_event_id"])).fetchone()
         return int(r["job_id"]) if r else 0
 
 def next_outbound_job() -> Optional[sqlite3.Row]:
     with state_db_conn() as con:
-        return con.execute(
-            "SELECT * FROM outbound_job WHERE status IN ('queued','failed') ORDER BY updated_ts ASC, job_id ASC LIMIT 1"
-        ).fetchone()
+        return con.execute("SELECT * FROM outbound_job WHERE status IN ('queued','failed') ORDER BY updated_ts ASC, job_id ASC LIMIT 1").fetchone()
 
-def update_outbound_job(job_id: int, status: str, error: Optional[str] = None) -> None:
+def update_outbound_job(job_id: int, status: str, error: Optional[str] = None, result: Optional[Dict[str, Any]] = None) -> None:
     now = int(time.time())
+    res_json = json.dumps(result, ensure_ascii=False) if result is not None else None
     with state_db_conn() as con:
-        con.execute(
-            "UPDATE outbound_job SET status=?, updated_ts=?, attempts=attempts+1, last_error=? WHERE job_id=?",
-            (status, now, error, job_id),
-        )
+        con.execute("UPDATE outbound_job SET status=?, updated_ts=?, attempts=attempts+1, last_error=?, result_json=? WHERE job_id=?", (status, now, error, res_json, job_id))
         con.commit()
 
-def mark_outbound_sent(job_id: int) -> None:
+def mark_outbound_sent(job_id: int, result: Optional[Dict[str, Any]] = None) -> None:
     now = int(time.time())
+    res_json = json.dumps(result, ensure_ascii=False) if result is not None else None
     with state_db_conn() as con:
-        con.execute("UPDATE outbound_job SET status='sent', updated_ts=? WHERE job_id=?", (now, job_id))
+        con.execute("UPDATE outbound_job SET status='sent', updated_ts=?, result_json=? WHERE job_id=?", (now, res_json, job_id))
         con.commit()
 
-def run_sender(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not GARMIN_SEND_CMD:
-        raise RuntimeError("GARMIN_SEND_CMD is not set; outbound sending is not configured.")
-    p = subprocess.run(
-        [GARMIN_SEND_CMD],
-        input=json.dumps(payload).encode("utf-8"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=GARMIN_SEND_TIMEOUT_SEC,
-    )
-    out = p.stdout.decode("utf-8", errors="replace").strip()
-    err = p.stderr.decode("utf-8", errors="replace").strip()
+def get_job_result(job_id: int) -> Optional[Dict[str, Any]]:
+    with state_db_conn() as con:
+        r = con.execute("SELECT result_json FROM outbound_job WHERE job_id=? LIMIT 1", (job_id,)).fetchone()
+        if not r or not r["result_json"]:
+            return None
+        try:
+            return json.loads(r["result_json"])
+        except Exception:
+            return None
+
+
+# ---- ADB/UI helpers ----
+
+def _adb_base_cmd() -> List[str]:
+    cmd = [str(ADB_BIN)]
+    if ADB_SERIAL:
+        cmd += ["-s", str(ADB_SERIAL)]
+    return cmd
+
+def adb(*args: str, timeout: int = 25) -> subprocess.CompletedProcess:
+    cmd = _adb_base_cmd() + list(args)
+    log("DEBUG", "adb", cmd=" ".join(cmd))
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+def adb_shell(cmd: str, timeout: int = 25) -> None:
+    p = adb("shell", cmd, timeout=timeout)
     if p.returncode != 0:
-        raise RuntimeError(f"sender failed rc={p.returncode} stderr={err[:400]}")
-    if not out:
-        return {"ok": True}
-    try:
-        return json.loads(out)
-    except Exception:
-        return {"ok": True, "raw": out[:800]}
-
-def poll_for_new_outgoing_ota(con: sqlite3.Connection, internet_conversation_id: str, since_ts: int, window_sec: int = 30) -> Optional[str]:
-    lower = max(0, since_ts - window_sec)
-    deadline = time.time() + OUTBOUND_POLL_AFTER_SEND_SEC
-    while time.time() < deadline:
-        rows = con.execute(
-            """
-            SELECT ota_uuid, id, sent_time, sort_time
-            FROM message
-            WHERE internet_conversation_id = ?
-              AND origin = 0
-              AND (sent_time >= ? OR sort_time >= ?)
-            ORDER BY sort_time DESC, id DESC
-            LIMIT 10
-            """,
-            (internet_conversation_id, lower, lower),
-        ).fetchall()
-        for r in rows:
-            if r["ota_uuid"]:
-                return str(r["ota_uuid"])
-        time.sleep(0.5)
+        raise RuntimeError(f"adb shell failed rc={p.returncode} stderr={p.stderr.decode(errors='replace')[:600]}")
     return None
 
+def adb_sleep(sec: float) -> None:
+    time.sleep(max(0.0, sec))
 
-# --------------------------------------------------------------------------------------
-# Poller
-# --------------------------------------------------------------------------------------
+def adb_dismiss_overlays() -> None:
+    if not ADB_DISMISS_BACK_TWICE:
+        return
+    try:
+        adb_shell("input keyevent 4; input keyevent 4", timeout=10)
+    except Exception:
+        pass
+
+def ui_dump(path: str = "/sdcard/ui.xml") -> None:
+    adb_shell(f"uiautomator dump {path} >/dev/null", timeout=20)
+
+def ui_tap_center_of_node_grep(pattern: str) -> None:
+    ui_dump()
+    pat = pattern.replace("'", r"'\''")
+    sh = f"""sh -lc '
+line=$(sed "s/></>\\n</g" /sdcard/ui.xml | grep -F "{pat}" | head -n 1)
+test -n "$line" || exit 2
+b=$(echo "$line" | sed -n "s/.*bounds=\\\"\\[\\([0-9]*\\),\\([0-9]*\\)\\]\\[\\([0-9]*\\),\\([0-9]*\\)\\]\\\".*/\\1 \\2 \\3 \\4/p")
+set -- $b
+x=$(( ( $1 + $3 ) / 2 ))
+y=$(( ( $2 + $4 ) / 2 ))
+input tap $x $y
+'"""
+    adb_shell(sh, timeout=25)
+
+def ui_tap_first_garmin_edittext() -> None:
+    ui_dump()
+    sh = r"""sh -lc '
+line=$(sed "s/></>\n</g" /sdcard/ui.xml   | grep "package=\"com.garmin.android.apps.messenger\""   | grep "class=\"android.widget.EditText\""   | head -n 1)
+test -n "$line" || exit 2
+b=$(echo "$line" | sed -n "s/.*bounds=\"\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\]\".*/\1 \2 \3 \4/p")
+set -- $b
+x=$(( ( $1 + $3 ) / 2 ))
+y=$(( ( $2 + $4 ) / 2 ))
+input tap $x $y
+'"""
+    adb_shell(sh, timeout=25)
+
+def start_activity_view(uri: str) -> None:
+    adb_shell(f'am start -a android.intent.action.VIEW -d "{uri}" -n {GARMIN_PKG}/{GARMIN_ACT} -f 0x10000000', timeout=25)
+
+def send_to_existing_thread(thread_id: int, msg: str) -> None:
+    adb_dismiss_overlays()
+    start_activity_view(f"inreach://messageThread/{int(thread_id)}")
+    adb_sleep(ADB_DEFAULT_SLEEP)
+    ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/newMessageInputEditText")
+    adb_shell(f'input text "{adb_text_escape(msg)}"', timeout=20)
+    adb_sleep(0.2)
+    ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/sendButton")
+
+def compose_new_thread_and_send(recipients: List[str], msg: str) -> None:
+    if not recipients:
+        raise ValueError("recipients must not be empty")
+    adb_dismiss_overlays()
+    start_activity_view("inreach://composedevicemessage/")
+    adb_sleep(ADB_COMPOSE_SLEEP)
+    ui_tap_first_garmin_edittext()
+    for r in recipients:
+        adb_shell(f'input text "{adb_text_escape(str(r))}"', timeout=20)
+        adb_shell("input keyevent 66", timeout=10)
+        adb_sleep(0.3)
+        adb_shell("input keyevent 61", timeout=10)
+        adb_sleep(0.2)
+        adb_shell("input keyevent 23", timeout=10)
+        adb_sleep(0.5)
+    ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/newMessageInputEditText")
+    adb_shell(f'input text "{adb_text_escape(msg)}"', timeout=20)
+    adb_sleep(0.2)
+    ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/sendButton")
+
+
+# ---- Outbound correlation ----
+
+def snapshot_conv_cursor(con: sqlite3.Connection, internet_conversation_id: str) -> Tuple[int, int]:
+    r = con.execute("SELECT IFNULL(MAX(sort_time),0) AS st, IFNULL(MAX(id),0) AS mid FROM message WHERE internet_conversation_id = ?", (internet_conversation_id,)).fetchone()
+    return (int(r["st"] or 0), int(r["mid"] or 0))
+
+def snapshot_global_cursor(con: sqlite3.Connection) -> Tuple[int, int]:
+    r = con.execute("SELECT IFNULL(MAX(sort_time),0) AS st, IFNULL(MAX(id),0) AS mid FROM message").fetchone()
+    return (int(r["st"] or 0), int(r["mid"] or 0))
+
+def find_new_outgoing_by_text(con: sqlite3.Connection, internet_conversation_id: Optional[str], after_sort_time: int, after_id: int, text: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    deadline = time.time() + int(OUTBOUND_DB_POLL_MAX_SEC)
+    text = text or ""
+    relaxed = text.replace("\\", "")
+    while time.time() < deadline:
+        if internet_conversation_id:
+            rows = con.execute(
+                """
+                SELECT ota_uuid, internet_conversation_id, id, sort_time, text
+                FROM message
+                WHERE internet_conversation_id = ?
+                  AND origin = 0
+                  AND ( sort_time > ? OR (sort_time = ? AND id > ?) )
+                ORDER BY sort_time DESC, id DESC
+                LIMIT 30
+                """,
+                (internet_conversation_id, after_sort_time, after_sort_time, after_id),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT ota_uuid, internet_conversation_id, id, sort_time, text
+                FROM message
+                WHERE origin = 0
+                  AND ( sort_time > ? OR (sort_time = ? AND id > ?) )
+                ORDER BY sort_time DESC, id DESC
+                LIMIT 80
+                """,
+                (after_sort_time, after_sort_time, after_id),
+            ).fetchall()
+
+        for r in rows:
+            if (r["text"] or "") == text and r["ota_uuid"]:
+                return (str(r["ota_uuid"]), str(r["internet_conversation_id"] or ""), int(r["id"]))
+        for r in rows:
+            if (r["text"] or "").replace("\\", "") == relaxed and r["ota_uuid"]:
+                return (str(r["ota_uuid"]), str(r["internet_conversation_id"] or ""), int(r["id"]))
+
+        time.sleep(max(0.05, float(OUTBOUND_DB_POLL_SEC)))
+    return (None, None, None)
+
+def resolve_thread_id_for_conversation(con: sqlite3.Connection, internet_conversation_id: str) -> Optional[int]:
+    r = con.execute("SELECT message_thread_id FROM message WHERE internet_conversation_id=? ORDER BY sort_time DESC, id DESC LIMIT 1", (internet_conversation_id,)).fetchone()
+    if not r:
+        return None
+    try:
+        return int(r["message_thread_id"]) if r["message_thread_id"] is not None else None
+    except Exception:
+        return None
+
+
+# ---- Inbound ----
 
 def compute_delivery_id(row: sqlite3.Row) -> str:
     if row["ota_uuid"]:
@@ -602,6 +672,78 @@ def fetch_new_messages(con: sqlite3.Connection, after_sort_time: int, after_id: 
     """
     return con.execute(q, (after_sort_time, after_sort_time, after_id, TAIL_LIMIT)).fetchall()
 
+@dataclasses.dataclass
+class PendingMedia:
+    delivery_id: str
+    row: sqlite3.Row
+    first_seen_ts: float
+    last_scan_ts: float
+    attempts: int
+
+def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str) -> bool:
+    conv = r["internet_conversation_id"]
+    link = get_link_by_conversation(str(conv))
+    if not link:
+        log("DEBUG", "unlinked conversation - skip forward", conv=conv, id=r["id"])
+        return False
+    if not MAUBOT_WEBHOOK_URL:
+        log("WARN", "MAUBOT_WEBHOOK_URL not set; cannot forward", delivery_id=delivery_id)
+        return False
+
+    room = link["matrix_room_id"]
+    origin = int(r["origin"] or 0)
+    ota_uuid = r["ota_uuid"]
+
+    attach_id = r["media_attachment_id"]
+    media = None
+    if attach_id:
+        best_path, candidates = resolve_media(con, ROOT_DIR, str(attach_id))
+        if best_path:
+            mb = size_mb(best_path)
+            if MAX_ATTACH_MB and mb > float(MAX_ATTACH_MB):
+                log("WARN", "media too large; not attaching path", delivery_id=delivery_id, mb=f"{mb:.2f}", limit=MAX_ATTACH_MB)
+                best_path = None
+        media = {
+            "attachment_id": str(attach_id),
+            "best_path": best_path,
+            "candidate_paths": candidates,
+            "media_type": r["media_type"],
+            "attachment_state": r["attachment_state"],
+            "duration": r["duration"],
+        }
+
+    payload = {
+        "event_type": "bridge_inbound",
+        "delivery_id": delivery_id,
+        "ota_uuid": str(ota_uuid) if ota_uuid else None,
+        "internet_conversation_id": str(conv),
+        "matrix_room_id": str(room),
+        "message": {
+            "id": int(r["id"]),
+            "origin": origin,
+            "from": r["from_addr"],
+            "text": r["text"],
+            "sent_time": epoch_s(r["sent_time"]),
+            "sort_time": epoch_s(r["sort_time"]),
+            "latitude": r["latitude"],
+            "longitude": r["longitude"],
+            "altitude": r["altitude"],
+        },
+        "media": media,
+        "source": "garmin_remote" if origin == 1 else "garmin_local",
+    }
+
+    try:
+        code, resp = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20)
+        if 200 <= code < 300:
+            log("INFO", "forwarded inbound", delivery_id=delivery_id, room=room, code=code)
+            return True
+        log("WARN", "maubot rejected", delivery_id=delivery_id, code=code, resp=resp[:600])
+        return False
+    except Exception as e:
+        log("WARN", "maubot forward failed", delivery_id=delivery_id, err=str(e))
+        return False
+
 def poll_loop(stop_evt: threading.Event) -> None:
     init_state()
     cur = load_cursor("poll_cursor", "0:0")
@@ -610,13 +752,13 @@ def poll_loop(stop_evt: threading.Event) -> None:
     except Exception:
         after_sort_time, after_id = 0, 0
 
+    pending: Dict[str, PendingMedia] = {}
     log("INFO", "poller starting", poll_sec=POLL_DB_SEC, tail_limit=TAIL_LIMIT)
 
     while not stop_evt.is_set():
         try:
             with garmin_db_conn() as con:
                 rows = fetch_new_messages(con, after_sort_time, after_id)
-
                 for r in rows:
                     after_sort_time = int(r["sort_time"] or 0)
                     after_id = int(r["id"] or 0)
@@ -627,37 +769,12 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         continue
 
                     delivery_id = compute_delivery_id(r)
-                    if is_acked(delivery_id):
-                        continue
 
-                    origin = int(r["origin"] or 0)
-                    ota_uuid = r["ota_uuid"]
-                    if origin == 0 and ota_uuid:
-                        corr = lookup_outbound_by_ota(str(ota_uuid))
-                        if corr:
-                            log("DEBUG", "echo suppressed", ota_uuid=ota_uuid, matrix_event_id=corr["matrix_event_id"])
-                            upsert_inbound_record({
-                                "delivery_id": delivery_id,
-                                "internet_conversation_id": conv,
-                                "message_row_id": int(r["id"]),
-                                "origin": origin,
-                                "sent_time": epoch_s(r["sent_time"]),
-                                "sort_time": epoch_s(r["sort_time"]),
-                                "from": r["from_addr"],
-                                "text": r["text"],
-                                "media_attachment_id": r["media_attachment_id"],
-                                "media_type": r["media_type"],
-                                "attachment_state": r["attachment_state"],
-                            })
-                            ack_delivery(delivery_id)
-                            continue
-
-                    link = get_link_by_conversation(conv)
                     upsert_inbound_record({
                         "delivery_id": delivery_id,
-                        "internet_conversation_id": conv,
+                        "internet_conversation_id": str(conv),
                         "message_row_id": int(r["id"]),
-                        "origin": origin,
+                        "origin": int(r["origin"] or 0),
                         "sent_time": epoch_s(r["sent_time"]),
                         "sort_time": epoch_s(r["sort_time"]),
                         "from": r["from_addr"],
@@ -667,136 +784,173 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         "attachment_state": r["attachment_state"],
                     })
 
-                    if not link:
-                        log("DEBUG", "unlinked conversation - skip forward", conv=conv, id=r["id"])
-                        continue
-                    if not MAUBOT_WEBHOOK_URL:
-                        log("WARN", "MAUBOT_WEBHOOK_URL not set; cannot forward", delivery_id=delivery_id)
+                    if is_acked(delivery_id):
                         continue
 
-                    room = link["matrix_room_id"]
+                    origin = int(r["origin"] or 0)
+                    ota_uuid = r["ota_uuid"]
+                    if origin == 0 and ota_uuid:
+                        corr = lookup_outbound_by_ota(str(ota_uuid))
+                        if corr:
+                            log("DEBUG", "echo suppressed", ota_uuid=ota_uuid, matrix_event_id=corr["matrix_event_id"])
+                            ack_delivery(delivery_id)
+                            continue
+
                     attach_id = r["media_attachment_id"]
-                    media = None
                     if attach_id:
-                        best_path, candidates = resolve_media(con, ROOT_DIR, str(attach_id))
-                        if best_path:
-                            mb = size_mb(best_path)
-                            if MAX_ATTACH_MB and mb > float(MAX_ATTACH_MB):
-                                best_path = None
-                        media = {
-                            "attachment_id": str(attach_id),
-                            "best_path": best_path,
-                            "candidate_paths": candidates,
-                            "media_type": r["media_type"],
-                            "attachment_state": r["attachment_state"],
-                            "duration": r["duration"],
-                        }
+                        best_path, _ = resolve_media(con, ROOT_DIR, str(attach_id))
+                        if not best_path:
+                            pending[delivery_id] = PendingMedia(delivery_id, r, time.time(), 0.0, 0)
+                            log("DEBUG", "queued pending media", delivery_id=delivery_id, attachment_id=str(attach_id))
+                            continue
 
-                    payload = {
-                        "delivery_id": delivery_id,
-                        "ota_uuid": str(ota_uuid) if ota_uuid else None,
-                        "internet_conversation_id": conv,
-                        "matrix_room_id": room,
-                        "message": {
-                            "id": int(r["id"]),
-                            "origin": origin,
-                            "from": r["from_addr"],
-                            "text": r["text"],
-                            "sent_time": epoch_s(r["sent_time"]),
-                            "sort_time": epoch_s(r["sort_time"]),
-                            "latitude": r["latitude"],
-                            "longitude": r["longitude"],
-                            "altitude": r["altitude"],
-                        },
-                        "media": media,
-                        "source": "garmin_remote" if origin == 1 else "garmin_local",
-                    }
+                    delivered = forward_to_maubot(con, r, delivery_id)
+                    if delivered:
+                        ack_delivery(delivery_id)
 
-                    try:
-                        code, resp = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20)
-                        if 200 <= code < 300:
-                            log("INFO", "forwarded inbound", delivery_id=delivery_id, room=room, code=code)
-                        else:
-                            log("WARN", "maubot rejected", delivery_id=delivery_id, code=code, resp=resp)
-                    except Exception as e:
-                        log("WARN", "maubot forward failed", delivery_id=delivery_id, err=str(e))
+                now = time.time()
+                for did, p in list(pending.items()):
+                    if is_acked(did):
+                        pending.pop(did, None)
+                        continue
+                    if (now - p.first_seen_ts) > float(PENDING_MEDIA_MAX_SEC) or p.attempts >= int(PENDING_MEDIA_MAX_ATTEMPTS):
+                        log("WARN", "pending media timeout; forwarding anyway", delivery_id=did, attempts=p.attempts)
+                        delivered = forward_to_maubot(con, p.row, did)
+                        if delivered:
+                            ack_delivery(did)
+                        pending.pop(did, None)
+                        continue
+                    if (now - p.last_scan_ts) < float(PENDING_MEDIA_RESCAN_SEC):
+                        continue
+                    p.attempts += 1
+                    p.last_scan_ts = now
+                    pending[did] = p
+                    attach_id = p.row["media_attachment_id"]
+                    best_path, _ = resolve_media(con, ROOT_DIR, str(attach_id))
+                    if best_path:
+                        log("INFO", "pending media resolved", delivery_id=did, path=best_path, attempts=p.attempts)
+                        delivered = forward_to_maubot(con, p.row, did)
+                        if delivered:
+                            ack_delivery(did)
+                        pending.pop(did, None)
 
         except Exception as e:
             log("WARN", "poll loop error", err=str(e))
 
-        time.sleep(POLL_DB_SEC)
+        time.sleep(max(0.05, float(POLL_DB_SEC)))
 
     log("INFO", "poller stopped")
 
 
-# --------------------------------------------------------------------------------------
-# Outbound worker
-# --------------------------------------------------------------------------------------
+# ---- Outbound worker ----
+
+def _emit_outbound_result(event: Dict[str, Any]) -> None:
+    if not MAUBOT_WEBHOOK_URL:
+        return
+    payload = {"event_type": "bridge_outbound_result", **event}
+    try:
+        code, _ = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20)
+        log("DEBUG", "outbound result posted", code=code)
+    except Exception as e:
+        log("WARN", "outbound result post failed", err=str(e))
 
 def outbound_worker(stop_evt: threading.Event) -> None:
     init_state()
     log("INFO", "outbound worker starting")
-
     while not stop_evt.is_set():
         try:
             job = next_outbound_job()
             if not job:
-                time.sleep(0.5)
+                time.sleep(0.25)
                 continue
 
             job_id = int(job["job_id"])
             room = str(job["matrix_room_id"])
             ev = str(job["matrix_event_id"])
-            kind = str(job["kind"])
+            kind = str(job["kind"]).strip()
             conv = job["internet_conversation_id"]
-
-            if not conv:
-                link = get_link_by_room(room)
-                if link:
-                    conv = link["internet_conversation_id"]
-
-            if not conv:
-                update_outbound_job(job_id, "failed", "No internet_conversation_id for room; link required.")
-                continue
 
             update_outbound_job(job_id, "sending", None)
 
-            payload = {"kind": kind, "internet_conversation_id": conv, "matrix": {"room_id": room, "event_id": ev}}
-            if kind == "text":
-                payload["text"] = job["text"] or ""
-            elif kind == "media":
-                if not job["media_path"]:
-                    update_outbound_job(job_id, "failed", "media_path missing")
+            with garmin_db_conn() as con_db:
+                if kind == "text":
+                    if not conv:
+                        update_outbound_job(job_id, "failed", "internet_conversation_id required for kind=text")
+                        continue
+                    thread_id = resolve_thread_id_for_conversation(con_db, str(conv))
+                    if not thread_id:
+                        update_outbound_job(job_id, "failed", "Could not resolve message_thread_id for conversation (no messages yet).")
+                        continue
+                    before_st, before_id = snapshot_conv_cursor(con_db, str(conv))
+                    text = str(job["text"] or "")
+                    send_to_existing_thread(int(thread_id), text)
+
+                    ota_uuid, conv_from_row, msg_row_id = find_new_outgoing_by_text(con_db, str(conv), before_st, before_id, text)
+                    result = {
+                        "job_id": job_id,
+                        "kind": "text",
+                        "matrix_room_id": room,
+                        "matrix_event_id": ev,
+                        "internet_conversation_id": str(conv_from_row or conv),
+                        "message_row_id": msg_row_id,
+                        "ota_uuid": ota_uuid,
+                        "thread_id_used": int(thread_id),
+                    }
+                    if ota_uuid:
+                        add_outbound_correlation(str(ota_uuid), room, ev)
+                        log("INFO", "outbound correlated", job_id=job_id, ota_uuid=str(ota_uuid))
+                    else:
+                        log("WARN", "outbound correlation failed", job_id=job_id)
+
+                    mark_outbound_sent(job_id, result=result)
+                    _emit_outbound_result(result)
                     continue
-                payload["media_path"] = job["media_path"]
-                if job["media_mime"]:
-                    payload["media_mime"] = job["media_mime"]
 
-            result = run_sender(payload)
-            ota_uuid = result.get("ota_uuid")
-            if not ota_uuid and isinstance(result.get("garmin"), dict):
-                ota_uuid = result["garmin"].get("ota_uuid")
+                if kind == "new_thread":
+                    try:
+                        recipients = json.loads(job["recipients_json"] or "[]")
+                    except Exception:
+                        recipients = []
+                    if not isinstance(recipients, list) or not recipients:
+                        update_outbound_job(job_id, "failed", "recipients_json must be a non-empty JSON list")
+                        continue
+                    text = str(job["text"] or "")
+                    before_st0, before_id0 = snapshot_global_cursor(con_db)
+                    compose_new_thread_and_send([str(x) for x in recipients], text)
+                    ota_uuid, conv_from_row, msg_row_id = find_new_outgoing_by_text(con_db, None, before_st0, before_id0, text)
 
-            if not ota_uuid:
-                with garmin_db_conn() as con:
-                    ota_uuid = poll_for_new_outgoing_ota(con, str(conv), int(time.time()))
+                    result = {
+                        "job_id": job_id,
+                        "kind": "new_thread",
+                        "matrix_room_id": room,
+                        "matrix_event_id": ev,
+                        "internet_conversation_id": conv_from_row,
+                        "message_row_id": msg_row_id,
+                        "ota_uuid": ota_uuid,
+                        "recipients": [str(x) for x in recipients],
+                    }
+                    if conv_from_row:
+                        upsert_link(str(conv_from_row), room)
+                    if ota_uuid:
+                        add_outbound_correlation(str(ota_uuid), room, ev)
+                        log("INFO", "new_thread correlated", job_id=job_id, ota_uuid=str(ota_uuid), conv=str(conv_from_row))
+                    else:
+                        log("WARN", "new_thread correlation failed", job_id=job_id)
 
-            if ota_uuid:
-                add_outbound_correlation(str(ota_uuid), room, ev)
-                log("INFO", "outbound correlated", job_id=job_id, ota_uuid=str(ota_uuid))
+                    mark_outbound_sent(job_id, result=result)
+                    _emit_outbound_result(result)
+                    continue
 
-            mark_outbound_sent(job_id)
+                update_outbound_job(job_id, "failed", f"Unsupported kind: {kind}")
 
         except Exception as e:
             log("WARN", "outbound worker error", err=str(e))
-            time.sleep(1.0)
+            time.sleep(0.8)
 
     log("INFO", "outbound worker stopped")
 
 
-# --------------------------------------------------------------------------------------
-# HTTP API
-# --------------------------------------------------------------------------------------
+# ---- HTTP API ----
 
 def _auth_ok(headers: Dict[str, str]) -> bool:
     if not HTTP_TOKEN:
@@ -821,7 +975,7 @@ def _send(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -
     handler.wfile.write(b)
 
 class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "garmin-bridge/1.0"
+    server_version = "garmin-bridge/2.0"
 
     def do_GET(self):  # noqa: N802
         if self.path == "/healthz":
@@ -852,18 +1006,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return _send(self, 400, {"ok": False, "error": "matrix_room_id and matrix_event_id required"})
 
             job: Dict[str, Any] = {"matrix_room_id": room, "matrix_event_id": ev, "internet_conversation_id": conv, "kind": kind}
+
             if kind == "text":
+                if not conv:
+                    return _send(self, 400, {"ok": False, "error": "internet_conversation_id required for kind=text"})
                 job["text"] = body.get("text") or ""
-            elif kind == "media":
-                if not body.get("media_path"):
-                    return _send(self, 400, {"ok": False, "error": "media_path required for kind=media"})
-                job["media_path"] = body.get("media_path")
-                job["media_mime"] = body.get("media_mime") or None
+            elif kind == "new_thread":
+                recips = body.get("recipients") or body.get("recipients_list")
+                if not isinstance(recips, list) or not recips:
+                    return _send(self, 400, {"ok": False, "error": "recipients must be a non-empty list"})
+                job["recipients_json"] = json.dumps([str(x) for x in recips], ensure_ascii=False)
+                job["text"] = body.get("text") or ""
             else:
                 return _send(self, 400, {"ok": False, "error": f"unsupported kind: {kind}"})
 
             jid = enqueue_outbound(job)
-            return _send(self, 200, {"ok": True, "job_id": jid})
+
+            extra: Dict[str, Any] = {}
+            if kind == "new_thread" and int(OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC) > 0:
+                deadline = time.time() + int(OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC)
+                while time.time() < deadline:
+                    res = get_job_result(jid)
+                    if res and res.get("internet_conversation_id"):
+                        extra["internet_conversation_id"] = res.get("internet_conversation_id")
+                        break
+                    time.sleep(0.25)
+
+            return _send(self, 200, {"ok": True, "job_id": jid, **extra})
 
         if self.path == "/inbound/ack":
             body = _read_json(self)
@@ -876,8 +1045,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return _send(self, 404, {"ok": False, "error": "not found"})
 
     def log_message(self, format: str, *args: Any) -> None:
-        if DEBUG:
-            log("DEBUG", "http", path=self.path, msg=(format % args))
+        log("DEBUG", "http", path=self.path, msg=(format % args))
 
 def http_server(stop_evt: threading.Event) -> None:
     init_state()
@@ -891,10 +1059,6 @@ def http_server(stop_evt: threading.Event) -> None:
         pass
 
 
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
-
 def validate_env() -> None:
     if not DB_PATH or not os.path.isfile(DB_PATH):
         raise SystemExit(f"DB_PATH not found or not a file: {DB_PATH!r}")
@@ -904,6 +1068,12 @@ def validate_env() -> None:
         u = urlparse(MAUBOT_WEBHOOK_URL)
         if not u.scheme or not u.netloc:
             raise SystemExit(f"MAUBOT_WEBHOOK_URL invalid: {MAUBOT_WEBHOOK_URL!r}")
+    try:
+        p = subprocess.run(_adb_base_cmd() + ["version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        if p.returncode != 0:
+            raise SystemExit(f"ADB not working: {p.stderr.decode(errors='replace')[:200]}")
+    except FileNotFoundError:
+        raise SystemExit(f"ADB_BIN not found: {ADB_BIN!r}")
 
 def main() -> None:
     validate_env()

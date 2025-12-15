@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
-"""Garmin Messenger ↔ Matrix (Maubot) bridge.
+"""
+Garmin Messenger ↔ Matrix (Maubot) bridge.
 
-Implements:
-1) Auto-ACK on successful forward to Maubot (2xx).
-2) Pending media re-scan (attachments can appear on disk after DB row is visible).
-3) Deterministic outbound correlation:
-   - Uses built-in ADB/UIAutomator flows.
-   - After the ADB flow completes, polls message.db for the new outgoing message and captures ota_uuid.
-   - Stores ota_uuid↔(matrix room,event) for echo suppression.
-   - For new_thread creation, also discovers the new internet_conversation_id and reports it.
+This build uses:
+- Minimal, schema-robust SELECT against Garmin `message` table (matching your PRAGMA table_info(message)).
+- Proven attachment-on-disk scan strategy (attachment_id only) identical in spirit to your email forwarder.
+- Pending media re-scan.
+- Outbound worker + echo suppression via ota_uuid correlation.
 
-4) Built-in ADB/UIAutomator flows:
-   - Send to existing thread via inreach://messageThread/<THREAD_ID>
-   - Compose new thread via inreach://composedevicemessage/ (recipients + first message)
-
-Maubot responsibilities:
-- Inbound webhook includes local file paths for attachments; Maubot uploads to Matrix.
-- For existing Garmin chat reply: call /outbound/enqueue with kind=text + internet_conversation_id.
-- For new Garmin chat: call /outbound/enqueue with kind=new_thread + recipients list; bridge returns (best-effort)
-  internet_conversation_id in response and always emits a webhook bridge_outbound_result event.
-
+Enhancement vs prior build:
+- Adds `media.mime` derived from filename extension (mimetypes.guess_type) with small overrides for
+  avif / ogg / oga / m4a to keep Maubot handling consistent.
 """
 
 from __future__ import annotations
@@ -27,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import mimetypes
 import os
 import signal
 import sqlite3
@@ -36,7 +28,6 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-
 import urllib.request
 
 
@@ -82,10 +73,16 @@ HTTP_BIND = env("HTTP_BIND", "127.0.0.1")
 HTTP_PORT = env("HTTP_PORT", 8808, int)
 HTTP_TOKEN = env("HTTP_TOKEN", "")
 
-# ---- Media ----
+# ---- Media (proven scan strategy) ----
 MAX_ATTACH_MB = env("MAX_ATTACH_MB", 25, int)
-MEDIA_EXTS = tuple(x.strip() for x in env("MEDIA_EXTS", "avif,jpg,jpeg,png,webp,gif,mp4,m4a,ogg,oga,wav", str).split(",") if x.strip())
-SEARCH_ROOTS = tuple(x.strip() for x in env("SEARCH_ROOTS", "high,preview,low,audio,", str).split(",") if x is not None)
+MEDIA_EXTS = tuple(
+    x.strip()
+    for x in env("MEDIA_EXTS", "avif,jpg,jpeg,png,webp,gif,mp4,m4a,ogg,oga,wav", str).split(",")
+    if x.strip()
+)
+
+_raw_roots = env("SEARCH_ROOTS", "high,preview,low,audio,", str).split(",")
+SEARCH_ROOTS = tuple(x.strip() for x in _raw_roots)  # keep "" if present
 
 PENDING_MEDIA_MAX_SEC = env("PENDING_MEDIA_MAX_SEC", 60, int)
 PENDING_MEDIA_RESCAN_SEC = env("PENDING_MEDIA_RESCAN_SEC", 1.0, float)
@@ -112,8 +109,10 @@ OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC = env("OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC",
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40}
 _CUR_LEVEL = _LEVELS.get(str(LOG_LEVEL).upper(), 20)
 
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
 
 def _safe_kv(v: Any) -> str:
     try:
@@ -121,6 +120,7 @@ def _safe_kv(v: Any) -> str:
         return s if len(s) <= 260 else s[:260] + "…"
     except Exception:
         return "<unprintable>"
+
 
 def log(level: str, msg: str, **fields: Any) -> None:
     lvl = _LEVELS.get(level.upper(), 20)
@@ -146,6 +146,7 @@ def garmin_db_conn() -> sqlite3.Connection:
     except Exception:
         pass
     return con
+
 
 def state_db_conn() -> sqlite3.Connection:
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -176,8 +177,6 @@ CREATE TABLE IF NOT EXISTS inbound_delivery (
     from_addr TEXT,
     text TEXT,
     media_attachment_id TEXT,
-    media_type INTEGER,
-    attachment_state INTEGER,
     acked INTEGER NOT NULL DEFAULT 0,
     delivered_ts INTEGER,
     last_error TEXT
@@ -231,97 +230,64 @@ def epoch_s(ts: Any) -> Optional[int]:
     except Exception:
         return None
 
+
 def size_mb(path: str) -> float:
     try:
         return os.path.getsize(path) / (1024 * 1024)
     except Exception:
         return 0.0
 
+
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
 
 def adb_text_escape(s: str) -> str:
     s = (s or "").replace("\n", " ").replace("\r", " ")
     return s.replace(" ", "%s")
 
 
-@dataclasses.dataclass(frozen=True)
-class MediaCandidate:
-    path: str
-    quality: Optional[int] = None
-    owner: Optional[int] = None
-    source: str = "unknown"  # table|scan
+# ---- Proven media scan (attachment_id only) ----
 
-def _table_columns(con: sqlite3.Connection, table: str) -> List[str]:
-    try:
-        rows = con.execute(f"PRAGMA table_info({table});").fetchall()
-        return [str(r["name"]) for r in rows]
-    except Exception:
-        return []
-
-def _normalize_media_path(root_dir: str, p: str) -> str:
-    p = (p or "").strip()
-    if not p:
-        return p
-    if os.path.isabs(p) and os.path.isfile(p):
-        return p
-    cand = os.path.join(root_dir, p)
-    if os.path.isfile(cand):
-        return cand
-    cand = os.path.join(root_dir, os.path.basename(p))
-    if os.path.isfile(cand):
-        return cand
-    return p
-
-def media_candidates_from_table(con: sqlite3.Connection, root_dir: str, attachment_id: str) -> List[MediaCandidate]:
-    cols = _table_columns(con, "media_attachment_file")
-    if not cols:
-        return []
-    possible_path_cols = [c for c in ("file_path", "path", "relative_path", "file_name") if c in cols]
-    if not possible_path_cols:
-        return []
-    sel = ", ".join(["attachment_id"] + [c for c in ("owner", "quality") if c in cols] + possible_path_cols)
-    q = f"SELECT {sel} FROM media_attachment_file WHERE attachment_id = ?"
-    rows = con.execute(q, (attachment_id,)).fetchall()
-    out: List[MediaCandidate] = []
-    for r in rows:
-        owner = r["owner"] if "owner" in r.keys() else None
-        quality = r["quality"] if "quality" in r.keys() else None
-        for pc in possible_path_cols:
-            p = r[pc]
-            if not p:
-                continue
-            np = _normalize_media_path(root_dir, str(p))
-            if os.path.isfile(np):
-                out.append(MediaCandidate(path=np, quality=quality, owner=owner, source="table"))
-    return out
-
-def media_candidates_by_scan(root_dir: str, attachment_id: str) -> List[MediaCandidate]:
-    out: List[MediaCandidate] = []
+def media_candidates_by_scan(root_dir: str, attachment_id: str) -> List[str]:
+    out: List[str] = []
+    if not attachment_id:
+        return out
     for sub in SEARCH_ROOTS:
-        d = os.path.join(root_dir, sub) if sub else root_dir
+        d = os.path.join(root_dir, sub)  # sub may be "" (root_dir)
         for ext in MEDIA_EXTS:
             p = os.path.join(d, f"{attachment_id}.{ext}")
             if os.path.isfile(p):
-                out.append(MediaCandidate(path=p, source="scan"))
+                out.append(p)
     return out
 
-def pick_best_media(cands: List[MediaCandidate]) -> Optional[MediaCandidate]:
-    if not cands:
-        return None
-    def key(c: MediaCandidate):
-        src_pri = 0 if c.source == "table" else 1
-        q = c.quality if c.quality is not None else -1
-        return (src_pri, -q, -size_mb(c.path))
-    return sorted(cands, key=key)[0]
 
-def resolve_media(con: sqlite3.Connection, root_dir: str, attachment_id: str) -> Tuple[Optional[str], List[str]]:
-    c1 = media_candidates_from_table(con, root_dir, attachment_id)
-    c2 = media_candidates_by_scan(root_dir, attachment_id)
-    seen = {c.path for c in c1}
-    all_cands = c1 + [c for c in c2 if c.path not in seen]
-    best = pick_best_media(all_cands)
-    return (best.path if best else None, [c.path for c in all_cands])
+def resolve_media(root_dir: str, attachment_id: str) -> Tuple[Optional[str], List[str]]:
+    cands = media_candidates_by_scan(root_dir, attachment_id)
+    best = cands[0] if cands else None
+    return best, cands
+
+
+def _guess_mime(path: Optional[str]) -> str:
+    """
+    Guess MIME type from filename extension, with small overrides for known
+    edge cases and better Maubot interoperability.
+    """
+    if not path:
+        return "application/octet-stream"
+
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    overrides = {
+        "avif": "image/avif",
+        "ogg": "audio/ogg",
+        "oga": "audio/ogg",
+        "m4a": "audio/mp4",
+    }
+    if ext in overrides:
+        return overrides[ext]
+
+    mt, _ = mimetypes.guess_type(path)
+    return mt or "application/octet-stream"
 
 
 def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int = 20) -> Tuple[int, str]:
@@ -339,6 +305,7 @@ def load_cursor(name: str, default: str = "") -> str:
     with state_db_conn() as con:
         r = con.execute("SELECT value FROM cursor WHERE name=? LIMIT 1", (name,)).fetchone()
         return str(r["value"]) if r and r["value"] is not None else default
+
 
 def save_cursor(name: str, value: str) -> None:
     with state_db_conn() as con:
@@ -366,14 +333,17 @@ def upsert_link(internet_conversation_id: str, matrix_room_id: str, account_id: 
         )
         con.commit()
 
+
 def get_link_by_conversation(internet_conversation_id: str) -> Optional[sqlite3.Row]:
     with state_db_conn() as con:
         return con.execute("SELECT * FROM conversation_link WHERE internet_conversation_id=? LIMIT 1", (internet_conversation_id,)).fetchone()
+
 
 def is_acked(delivery_id: str) -> bool:
     with state_db_conn() as con:
         r = con.execute("SELECT acked FROM inbound_delivery WHERE delivery_id=? LIMIT 1", (delivery_id,)).fetchone()
         return bool(r and int(r["acked"] or 0) == 1)
+
 
 def ack_delivery(delivery_id: str) -> None:
     now = int(time.time())
@@ -381,14 +351,15 @@ def ack_delivery(delivery_id: str) -> None:
         con.execute("UPDATE inbound_delivery SET acked=1, delivered_ts=? WHERE delivery_id=?", (now, delivery_id))
         con.commit()
 
+
 def upsert_inbound_record(delivery: Dict[str, Any]) -> None:
     with state_db_conn() as con:
         con.execute(
             """
             INSERT INTO inbound_delivery(
               delivery_id, internet_conversation_id, message_row_id, origin, sent_time, sort_time, from_addr, text,
-              media_attachment_id, media_type, attachment_state
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+              media_attachment_id
+            ) VALUES(?,?,?,?,?,?,?,?,?)
             ON CONFLICT(delivery_id) DO UPDATE SET
               internet_conversation_id=excluded.internet_conversation_id,
               message_row_id=COALESCE(excluded.message_row_id, inbound_delivery.message_row_id),
@@ -397,9 +368,7 @@ def upsert_inbound_record(delivery: Dict[str, Any]) -> None:
               sort_time=excluded.sort_time,
               from_addr=excluded.from_addr,
               text=excluded.text,
-              media_attachment_id=excluded.media_attachment_id,
-              media_type=excluded.media_type,
-              attachment_state=excluded.attachment_state
+              media_attachment_id=excluded.media_attachment_id
             """,
             (
                 delivery["delivery_id"],
@@ -411,11 +380,10 @@ def upsert_inbound_record(delivery: Dict[str, Any]) -> None:
                 delivery.get("from"),
                 delivery.get("text"),
                 delivery.get("media_attachment_id"),
-                delivery.get("media_type"),
-                delivery.get("attachment_state"),
             ),
         )
         con.commit()
+
 
 def add_outbound_correlation(ota_uuid: str, matrix_room_id: str, matrix_event_id: str) -> None:
     now = int(time.time())
@@ -426,6 +394,7 @@ def add_outbound_correlation(ota_uuid: str, matrix_room_id: str, matrix_event_id
             (ota_uuid, matrix_room_id, matrix_event_id, now),
         )
         con.commit()
+
 
 def lookup_outbound_by_ota(ota_uuid: str) -> Optional[sqlite3.Row]:
     with state_db_conn() as con:
@@ -455,19 +424,30 @@ def enqueue_outbound(job: Dict[str, Any]) -> int:
             ),
         )
         con.commit()
-        r = con.execute("SELECT job_id FROM outbound_job WHERE matrix_room_id=? AND matrix_event_id=? LIMIT 1", (job["matrix_room_id"], job["matrix_event_id"])).fetchone()
+        r = con.execute(
+            "SELECT job_id FROM outbound_job WHERE matrix_room_id=? AND matrix_event_id=? LIMIT 1",
+            (job["matrix_room_id"], job["matrix_event_id"]),
+        ).fetchone()
         return int(r["job_id"]) if r else 0
+
 
 def next_outbound_job() -> Optional[sqlite3.Row]:
     with state_db_conn() as con:
-        return con.execute("SELECT * FROM outbound_job WHERE status IN ('queued','failed') ORDER BY updated_ts ASC, job_id ASC LIMIT 1").fetchone()
+        return con.execute(
+            "SELECT * FROM outbound_job WHERE status IN ('queued','failed') ORDER BY updated_ts ASC, job_id ASC LIMIT 1"
+        ).fetchone()
+
 
 def update_outbound_job(job_id: int, status: str, error: Optional[str] = None, result: Optional[Dict[str, Any]] = None) -> None:
     now = int(time.time())
     res_json = json.dumps(result, ensure_ascii=False) if result is not None else None
     with state_db_conn() as con:
-        con.execute("UPDATE outbound_job SET status=?, updated_ts=?, attempts=attempts+1, last_error=?, result_json=? WHERE job_id=?", (status, now, error, res_json, job_id))
+        con.execute(
+            "UPDATE outbound_job SET status=?, updated_ts=?, attempts=attempts+1, last_error=?, result_json=? WHERE job_id=?",
+            (status, now, error, res_json, job_id),
+        )
         con.commit()
+
 
 def mark_outbound_sent(job_id: int, result: Optional[Dict[str, Any]] = None) -> None:
     now = int(time.time())
@@ -475,6 +455,7 @@ def mark_outbound_sent(job_id: int, result: Optional[Dict[str, Any]] = None) -> 
     with state_db_conn() as con:
         con.execute("UPDATE outbound_job SET status='sent', updated_ts=?, result_json=? WHERE job_id=?", (now, res_json, job_id))
         con.commit()
+
 
 def get_job_result(job_id: int) -> Optional[Dict[str, Any]]:
     with state_db_conn() as con:
@@ -495,10 +476,12 @@ def _adb_base_cmd() -> List[str]:
         cmd += ["-s", str(ADB_SERIAL)]
     return cmd
 
+
 def adb(*args: str, timeout: int = 25) -> subprocess.CompletedProcess:
     cmd = _adb_base_cmd() + list(args)
     log("DEBUG", "adb", cmd=" ".join(cmd))
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
 
 def adb_shell(cmd: str, timeout: int = 25) -> None:
     p = adb("shell", cmd, timeout=timeout)
@@ -506,8 +489,10 @@ def adb_shell(cmd: str, timeout: int = 25) -> None:
         raise RuntimeError(f"adb shell failed rc={p.returncode} stderr={p.stderr.decode(errors='replace')[:600]}")
     return None
 
+
 def adb_sleep(sec: float) -> None:
     time.sleep(max(0.0, sec))
+
 
 def adb_dismiss_overlays() -> None:
     if not ADB_DISMISS_BACK_TWICE:
@@ -517,8 +502,10 @@ def adb_dismiss_overlays() -> None:
     except Exception:
         pass
 
+
 def ui_dump(path: str = "/sdcard/ui.xml") -> None:
     adb_shell(f"uiautomator dump {path} >/dev/null", timeout=20)
+
 
 def ui_tap_center_of_node_grep(pattern: str) -> None:
     ui_dump()
@@ -534,6 +521,7 @@ input tap $x $y
 '"""
     adb_shell(sh, timeout=25)
 
+
 def ui_tap_first_garmin_edittext() -> None:
     ui_dump()
     sh = r"""sh -lc '
@@ -547,8 +535,10 @@ input tap $x $y
 '"""
     adb_shell(sh, timeout=25)
 
+
 def start_activity_view(uri: str) -> None:
     adb_shell(f'am start -a android.intent.action.VIEW -d "{uri}" -n {GARMIN_PKG}/{GARMIN_ACT} -f 0x10000000', timeout=25)
+
 
 def send_to_existing_thread(thread_id: int, msg: str) -> None:
     adb_dismiss_overlays()
@@ -558,6 +548,7 @@ def send_to_existing_thread(thread_id: int, msg: str) -> None:
     adb_shell(f'input text "{adb_text_escape(msg)}"', timeout=20)
     adb_sleep(0.2)
     ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/sendButton")
+
 
 def compose_new_thread_and_send(recipients: List[str], msg: str) -> None:
     if not recipients:
@@ -586,9 +577,11 @@ def snapshot_conv_cursor(con: sqlite3.Connection, internet_conversation_id: str)
     r = con.execute("SELECT IFNULL(MAX(sort_time),0) AS st, IFNULL(MAX(id),0) AS mid FROM message WHERE internet_conversation_id = ?", (internet_conversation_id,)).fetchone()
     return (int(r["st"] or 0), int(r["mid"] or 0))
 
+
 def snapshot_global_cursor(con: sqlite3.Connection) -> Tuple[int, int]:
     r = con.execute("SELECT IFNULL(MAX(sort_time),0) AS st, IFNULL(MAX(id),0) AS mid FROM message").fetchone()
     return (int(r["st"] or 0), int(r["mid"] or 0))
+
 
 def find_new_outgoing_by_text(con: sqlite3.Connection, internet_conversation_id: Optional[str], after_sort_time: int, after_id: int, text: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     deadline = time.time() + int(OUTBOUND_DB_POLL_MAX_SEC)
@@ -631,6 +624,7 @@ def find_new_outgoing_by_text(con: sqlite3.Connection, internet_conversation_id:
         time.sleep(max(0.05, float(OUTBOUND_DB_POLL_SEC)))
     return (None, None, None)
 
+
 def resolve_thread_id_for_conversation(con: sqlite3.Connection, internet_conversation_id: str) -> Optional[int]:
     r = con.execute("SELECT message_thread_id FROM message WHERE internet_conversation_id=? ORDER BY sort_time DESC, id DESC LIMIT 1", (internet_conversation_id,)).fetchone()
     if not r:
@@ -653,14 +647,25 @@ def compute_delivery_id(row: sqlite3.Row) -> str:
     att = str(row["media_attachment_id"] or "")
     return "fb_" + sha1_hex("|".join([conv, mid, sent, txt, att]))[:24]
 
+
 def fetch_new_messages(con: sqlite3.Connection, after_sort_time: int, after_id: int) -> List[sqlite3.Row]:
     q = """
         SELECT
-          id, message_thread_id, internet_conversation_id,
-          origin, status, web_transfer_state, "from" as from_addr,
-          text, sort_time, sent_time, ota_uuid,
-          media_attachment_id, media_type, attachment_state, duration,
-          latitude, longitude, altitude
+          id,
+          message_thread_id,
+          internet_conversation_id,
+          origin,
+          status,
+          web_transfer_state,
+          "from" as from_addr,
+          text,
+          sort_time,
+          sent_time,
+          ota_uuid,
+          media_attachment_id,
+          latitude,
+          longitude,
+          altitude
         FROM message
         WHERE internet_conversation_id IS NOT NULL
           AND (
@@ -672,6 +677,7 @@ def fetch_new_messages(con: sqlite3.Connection, after_sort_time: int, after_id: 
     """
     return con.execute(q, (after_sort_time, after_sort_time, after_id, TAIL_LIMIT)).fetchall()
 
+
 @dataclasses.dataclass
 class PendingMedia:
     delivery_id: str
@@ -679,6 +685,7 @@ class PendingMedia:
     first_seen_ts: float
     last_scan_ts: float
     attempts: int
+
 
 def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str) -> bool:
     conv = r["internet_conversation_id"]
@@ -697,19 +704,22 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
     attach_id = r["media_attachment_id"]
     media = None
     if attach_id:
-        best_path, candidates = resolve_media(con, ROOT_DIR, str(attach_id))
+        best_path, candidates = resolve_media(ROOT_DIR, str(attach_id))
+
+        # Size guard applies only to best_path; candidates are still useful as fallbacks in Maubot.
         if best_path:
             mb = size_mb(best_path)
             if MAX_ATTACH_MB and mb > float(MAX_ATTACH_MB):
-                log("WARN", "media too large; not attaching path", delivery_id=delivery_id, mb=f"{mb:.2f}", limit=MAX_ATTACH_MB)
+                log("WARN", "media too large; not attaching best_path", delivery_id=delivery_id, mb=f"{mb:.2f}", limit=MAX_ATTACH_MB)
                 best_path = None
+
+        mime_probe_path = best_path or (candidates[0] if candidates else None)
         media = {
             "attachment_id": str(attach_id),
             "best_path": best_path,
             "candidate_paths": candidates,
-            "media_type": r["media_type"],
-            "attachment_state": r["attachment_state"],
-            "duration": r["duration"],
+            "mime": _guess_mime(mime_probe_path),
+            "mime_source": "filename",
         }
 
     payload = {
@@ -743,6 +753,7 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
     except Exception as e:
         log("WARN", "maubot forward failed", delivery_id=delivery_id, err=str(e))
         return False
+
 
 def poll_loop(stop_evt: threading.Event) -> None:
     init_state()
@@ -780,8 +791,6 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         "from": r["from_addr"],
                         "text": r["text"],
                         "media_attachment_id": r["media_attachment_id"],
-                        "media_type": r["media_type"],
-                        "attachment_state": r["attachment_state"],
                     })
 
                     if is_acked(delivery_id):
@@ -798,7 +807,7 @@ def poll_loop(stop_evt: threading.Event) -> None:
 
                     attach_id = r["media_attachment_id"]
                     if attach_id:
-                        best_path, _ = resolve_media(con, ROOT_DIR, str(attach_id))
+                        best_path, _ = resolve_media(ROOT_DIR, str(attach_id))
                         if not best_path:
                             pending[delivery_id] = PendingMedia(delivery_id, r, time.time(), 0.0, 0)
                             log("DEBUG", "queued pending media", delivery_id=delivery_id, attachment_id=str(attach_id))
@@ -826,7 +835,7 @@ def poll_loop(stop_evt: threading.Event) -> None:
                     p.last_scan_ts = now
                     pending[did] = p
                     attach_id = p.row["media_attachment_id"]
-                    best_path, _ = resolve_media(con, ROOT_DIR, str(attach_id))
+                    best_path, _ = resolve_media(ROOT_DIR, str(attach_id))
                     if best_path:
                         log("INFO", "pending media resolved", delivery_id=did, path=best_path, attempts=p.attempts)
                         delivered = forward_to_maubot(con, p.row, did)
@@ -853,6 +862,7 @@ def _emit_outbound_result(event: Dict[str, Any]) -> None:
         log("DEBUG", "outbound result posted", code=code)
     except Exception as e:
         log("WARN", "outbound result post failed", err=str(e))
+
 
 def outbound_worker(stop_evt: threading.Event) -> None:
     init_state()
@@ -958,6 +968,7 @@ def _auth_ok(headers: Dict[str, str]) -> bool:
     auth = headers.get("authorization") or headers.get("Authorization") or ""
     return auth.startswith("Bearer ") and auth.split(" ", 1)[1].strip() == HTTP_TOKEN
 
+
 def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
     n = int(handler.headers.get("content-length") or "0")
     raw = handler.rfile.read(n) if n > 0 else b"{}"
@@ -965,6 +976,7 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
         return json.loads(raw.decode("utf-8", errors="replace") or "{}")
     except Exception:
         return {}
+
 
 def _send(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
     b = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -974,8 +986,9 @@ def _send(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -
     handler.end_headers()
     handler.wfile.write(b)
 
+
 class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "garmin-bridge/2.0"
+    server_version = "garmin-bridge/2.2"
 
     def do_GET(self):  # noqa: N802
         if self.path == "/healthz":
@@ -1047,6 +1060,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         log("DEBUG", "http", path=self.path, msg=(format % args))
 
+
 def http_server(stop_evt: threading.Event) -> None:
     init_state()
     srv = ThreadingHTTPServer((HTTP_BIND, int(HTTP_PORT)), BridgeHandler)
@@ -1075,6 +1089,7 @@ def validate_env() -> None:
     except FileNotFoundError:
         raise SystemExit(f"ADB_BIN not found: {ADB_BIN!r}")
 
+
 def main() -> None:
     validate_env()
     init_state()
@@ -1099,6 +1114,7 @@ def main() -> None:
         time.sleep(0.5)
 
     log("INFO", "bridge exiting")
+
 
 if __name__ == "__main__":
     main()

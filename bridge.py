@@ -81,7 +81,7 @@ LOG_JSON = env("LOG_JSON", False, bool)
 # ---- Webhook to Maubot ----
 MAUBOT_WEBHOOK_URL = env("MAUBOT_WEBHOOK_URL", "")
 MAUBOT_WEBHOOK_TOKEN = env("MAUBOT_WEBHOOK_TOKEN", "")
-
+BACKFILL = env("BACKFILL", 0, int)  # 0=no backfill on first run, N=backfill N newest messages on first run
 # ---- HMAC (optional) ----
 HMAC_SECRET = env("HMAC_SECRET", "")
 HMAC_HEADER = env("HMAC_HEADER", "X-Bridge-HMAC")
@@ -499,6 +499,41 @@ def get_link_by_conversation(internet_conversation_id: str) -> Optional[sqlite3.
     with state_db_conn() as con:
         return con.execute("SELECT * FROM conversation_link WHERE internet_conversation_id=? LIMIT 1", (internet_conversation_id,)).fetchone()
 
+
+def _bootstrap_cursor(con: sqlite3.Connection, backfill_n: int) -> Tuple[int, int]:
+    """
+    Compute initial (after_sort_time, after_id) for polling.
+
+    Semantics:
+      BACKFILL=0  -> start at latest (do not forward historical messages)
+      BACKFILL=N  -> forward exactly the N newest messages (global) on first start
+
+    Implementation note:
+      fetch_new_messages() returns rows with (sort_time > after_sort_time) OR (sort_time=after_sort_time AND id > after_id).
+      To emit the N newest rows, we set the cursor to the (N+1)th newest row (OFFSET N).
+      If fewer than N+1 rows exist, we return 0:0, which will emit everything available (<=N rows).
+    """
+    n = max(0, int(backfill_n or 0))
+
+    if n <= 0:
+        st, mid = snapshot_global_cursor(con)
+        return int(st), int(mid)
+
+    row = con.execute(
+        """
+        SELECT sort_time, id
+        FROM message
+        WHERE internet_conversation_id IS NOT NULL
+        ORDER BY sort_time DESC, id DESC
+        LIMIT 1 OFFSET ?
+        """,
+        (n,),
+    ).fetchone()
+
+    if row:
+        return int(row["sort_time"] or 0), int(row["id"] or 0)
+
+    return 0, 0
 
 # ---- New: matrix event mapping helpers ----
 
@@ -1591,6 +1626,7 @@ def _process_reaction_retry_batch() -> None:
 def poll_loop(stop_evt: threading.Event) -> None:
     init_state()
 
+    # Cursor: (after_sort_time, after_id)
     cur = load_cursor("poll_cursor", "0:0")
     try:
         after_sort_time, after_id = [int(x) for x in cur.split(":", 1)]
@@ -1598,42 +1634,47 @@ def poll_loop(stop_evt: threading.Event) -> None:
         after_sort_time, after_id = 0, 0
 
     pending: Dict[str, PendingMedia] = {}
-    do_backfill = str(INBOUND_MODE).strip().lower() == "backfill"
 
-    log("INFO", "poller starting", poll_sec=POLL_DB_SEC, tail_limit=TAIL_LIMIT, inbound_mode=INBOUND_MODE)
+    log(
+        "INFO",
+        "poller starting",
+        poll_sec=POLL_DB_SEC,
+        batch_limit=TAIL_LIMIT,
+        backfill=BACKFILL,
+        cursor=f"{after_sort_time}:{after_id}",
+    )
+
+    # First-run bootstrap:
+    # - BACKFILL=0  => start at latest (emit nothing historical)
+    # - BACKFILL=N  => emit exactly N newest messages (global) on first start
+    if after_sort_time == 0 and after_id == 0:
+        try:
+            with garmin_db_conn() as con0:
+                bst, bid = _bootstrap_cursor(con0, BACKFILL)
+            after_sort_time, after_id = int(bst), int(bid)
+            save_cursor("poll_cursor", f"{after_sort_time}:{after_id}")
+            log(
+                "INFO",
+                "cursor bootstrapped",
+                backfill=BACKFILL,
+                after_sort_time=after_sort_time,
+                after_id=after_id,
+            )
+        except Exception as e:
+            # Conservative fallback: replay from 0:0 (may cause historical emit)
+            log("WARN", "cursor bootstrap failed; will replay from 0:0", err=str(e))
 
     while not stop_evt.is_set():
         try:
             with garmin_db_conn() as con:
-                if do_backfill:
-                    rows_bf = fetch_backfill_messages(con, int(INBOUND_BACKFILL_SINCE_EPOCH), limit=500)
-                    if rows_bf:
-                        log("INFO", "backfill batch", n=len(rows_bf), since=INBOUND_BACKFILL_SINCE_EPOCH)
-                        for r in rows_bf:
-                            conv = r["internet_conversation_id"]
-                            if not conv:
-                                continue
-                            delivery_id = compute_delivery_id(r)
-                            upsert_inbound_record({
-                                "delivery_id": delivery_id,
-                                "internet_conversation_id": str(conv),
-                                "message_row_id": int(r["id"]),
-                                "origin": int(r["origin"] or 0),
-                                "sent_time": epoch_s(r["sent_time"]),
-                                "sort_time": epoch_s(r["sort_time"]),
-                                "from": r["from_addr"],
-                                "text": r["text"],
-                                "media_attachment_id": r["media_attachment_id"],
-                            })
-                        do_backfill = False
-                        log("INFO", "backfill queued; switching to tail")
-
+                # Retry batches first (so previously-failed items get priority)
                 _process_inbound_retry_batch(con)
                 _process_reaction_retry_batch()
 
                 # 1) normal messages
                 rows = fetch_new_messages(con, after_sort_time, after_id)
                 for r in rows:
+                    # advance cursor immediately (at-least-once semantics)
                     after_sort_time = int(r["sort_time"] or 0)
                     after_id = int(r["id"] or 0)
                     save_cursor("poll_cursor", f"{after_sort_time}:{after_id}")
@@ -1644,17 +1685,20 @@ def poll_loop(stop_evt: threading.Event) -> None:
 
                     delivery_id = compute_delivery_id(r)
 
-                    upsert_inbound_record({
-                        "delivery_id": delivery_id,
-                        "internet_conversation_id": str(conv),
-                        "message_row_id": int(r["id"]),
-                        "origin": int(r["origin"] or 0),
-                        "sent_time": epoch_s(r["sent_time"]),
-                        "sort_time": epoch_s(r["sort_time"]),
-                        "from": r["from_addr"],
-                        "text": r["text"],
-                        "media_attachment_id": r["media_attachment_id"],
-                    })
+                    # Persist delivery record idempotently
+                    upsert_inbound_record(
+                        {
+                            "delivery_id": delivery_id,
+                            "internet_conversation_id": str(conv),
+                            "message_row_id": int(r["id"]),
+                            "origin": int(r["origin"] or 0),
+                            "sent_time": epoch_s(r["sent_time"]),
+                            "sort_time": epoch_s(r["sort_time"]),
+                            "from": r["from_addr"],
+                            "text": r["text"],
+                            "media_attachment_id": r["media_attachment_id"],
+                        }
+                    )
 
                     if is_acked(delivery_id):
                         continue
@@ -1662,15 +1706,14 @@ def poll_loop(stop_evt: threading.Event) -> None:
                     origin = int(r["origin"] or 0)
                     ota_uuid = r["ota_uuid"]
 
-                    # NEW: origin=0 handling:
-                    # - if it's a Matrix echo => suppress
-                    # - otherwise forward to Maubot (so local Garmin typed messages reach Matrix)
+                    # origin=0: suppress Matrix echoes, but forward real Garmin-local typed messages
                     if origin == 0:
                         if _is_matrix_echo_origin0(str(conv), str(ota_uuid) if ota_uuid else None, r["text"]):
                             log("DEBUG", "echo suppressed", conv=str(conv), ota_uuid=str(ota_uuid or ""))
                             ack_delivery(delivery_id)
                             continue
 
+                    # media gating (pending scan)
                     attach_id = r["media_attachment_id"]
                     if attach_id:
                         best_path, _ = resolve_media(ROOT_DIR, str(attach_id))
@@ -1685,7 +1728,7 @@ def poll_loop(stop_evt: threading.Event) -> None:
                     else:
                         schedule_inbound_retry(delivery_id, "maubot delivery failed (initial)")
 
-                # 2) reactions (separate query, same cursor semantics)
+                # 2) reactions (separate query; same cursor semantics)
                 rrows = fetch_new_reactions(con, after_sort_time, after_id)
                 for rr in rrows:
                     # advance cursor to reaction rm.sort_time/id
@@ -1706,30 +1749,41 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         continue
 
                     did = str(reaction_ota)
-                    upsert_inbound_reaction_record({
-                        "delivery_id": did,
-                        "conv_id": str(conv_id),
-                        "reaction_ota_uuid": str(reaction_ota),
-                        "target_ota_uuid": str(target_ota),
-                        "operation": int(op),
-                        "emoji": str(emoji),
-                    })
+
+                    upsert_inbound_reaction_record(
+                        {
+                            "delivery_id": did,
+                            "conv_id": str(conv_id),
+                            "reaction_ota_uuid": str(reaction_ota),
+                            "target_ota_uuid": str(target_ota),
+                            "operation": int(op),
+                            "emoji": str(emoji),
+                        }
+                    )
 
                     if is_reaction_acked(did):
                         continue
 
-                    ok = forward_reaction_to_maubot(str(conv_id), str(reaction_ota), str(target_ota), str(emoji), int(op), int(rr["reaction_sort_time"] or 0))
+                    ok = forward_reaction_to_maubot(
+                        str(conv_id),
+                        str(reaction_ota),
+                        str(target_ota),
+                        str(emoji),
+                        int(op),
+                        int(rr["reaction_sort_time"] or 0),
+                    )
                     if ok:
                         ack_reaction_delivery(did)
                     else:
                         schedule_reaction_retry(did, "maubot reaction delivery failed (initial)")
 
-                # pending media resolution (unchanged)
+                # 3) pending media resolution (unchanged behavior)
                 now = time.time()
                 for did, p in list(pending.items()):
                     if is_acked(did):
                         pending.pop(did, None)
                         continue
+
                     if (now - p.first_seen_ts) > float(PENDING_MEDIA_MAX_SEC) or p.attempts >= int(PENDING_MEDIA_MAX_ATTEMPTS):
                         log("WARN", "pending media timeout; forwarding anyway", delivery_id=did, attempts=p.attempts)
                         delivered = forward_to_maubot(con, p.row, did)
@@ -1739,11 +1793,14 @@ def poll_loop(stop_evt: threading.Event) -> None:
                             schedule_inbound_retry(did, "maubot delivery failed (pending timeout)")
                         pending.pop(did, None)
                         continue
+
                     if (now - p.last_scan_ts) < float(PENDING_MEDIA_RESCAN_SEC):
                         continue
+
                     p.attempts += 1
                     p.last_scan_ts = now
                     pending[did] = p
+
                     attach_id = p.row["media_attachment_id"]
                     best_path, _ = resolve_media(ROOT_DIR, str(attach_id))
                     if best_path:
@@ -1761,6 +1818,7 @@ def poll_loop(stop_evt: threading.Event) -> None:
         time.sleep(max(0.05, float(POLL_DB_SEC)))
 
     log("INFO", "poller stopped")
+
 
 
 # ---- Outbound worker ----

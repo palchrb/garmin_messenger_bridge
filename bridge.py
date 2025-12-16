@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-Garmin Messenger ↔ Matrix (Maubot) bridge.
+Garmin Messenger ↔ Matrix (Maubot) bridge — Hybrid C.
 
-This build uses:
-- Minimal, schema-robust SELECT against Garmin `message` table (matching your PRAGMA table_info(message)).
-- Proven attachment-on-disk scan strategy (attachment_id only) identical in spirit to your email forwarder.
-- Pending media re-scan.
-- Outbound worker + echo suppression via ota_uuid correlation.
-
-Enhancement vs prior build:
-- Adds `media.mime` derived from filename extension (mimetypes.guess_type) with small overrides for
-  avif / ogg / oga / m4a to keep Maubot handling consistent.
+Updates in this version (only what's needed to reflect the proposed improvements):
+- Outbound (existing thread): keyevent TAB navigation + verification via `dumpsys input_method`
+  to ensure we reach `app:id/newMessageInputEditText`, then send Unicode via ADBKeyBoard
+  Base64 broadcast, then TAB+ENTER to send.
+- Outbound (new thread): keep existing UIA logic to reach the message input field (rare path),
+  but use ADBKeyBoard Base64 for message text and TAB+ENTER to send.
+- Kick ADBKeyBoard via Quick Search Box BEFORE EVERY outbound message send.
+- Enable + set ADBKeyBoard IME on startup (best effort) and as a guard before outbound sends.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
+import random
+import re
 import signal
 import sqlite3
 import subprocess
@@ -29,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import urllib.request
+import base64
 
 
 def env(name: str, default: Any = None, cast: Any = str):
@@ -68,6 +71,10 @@ LOG_JSON = env("LOG_JSON", False, bool)
 MAUBOT_WEBHOOK_URL = env("MAUBOT_WEBHOOK_URL", "")
 MAUBOT_WEBHOOK_TOKEN = env("MAUBOT_WEBHOOK_TOKEN", "")
 
+# ---- HMAC (optional) ----
+HMAC_SECRET = env("HMAC_SECRET", "")
+HMAC_HEADER = env("HMAC_HEADER", "X-Bridge-HMAC")
+
 # ---- HTTP API ----
 HTTP_BIND = env("HTTP_BIND", "127.0.0.1")
 HTTP_PORT = env("HTTP_PORT", 8808, int)
@@ -93,6 +100,7 @@ SQLITE_TIMEOUT = env("SQLITE_TIMEOUT", 2.5, float)
 # ---- ADB/UI automation ----
 ADB_BIN = env("ADB_BIN", "adb")
 ADB_SERIAL = env("ADB_SERIAL", "")
+ADB_TARGET = env("ADB_TARGET", "")  # e.g. redroid12:5555
 GARMIN_PKG = env("GARMIN_PKG", "com.garmin.android.apps.messenger")
 GARMIN_ACT = env("GARMIN_ACT", ".activity.MainActivity")
 
@@ -100,14 +108,41 @@ ADB_DEFAULT_SLEEP = env("ADB_DEFAULT_SLEEP", 0.8, float)
 ADB_COMPOSE_SLEEP = env("ADB_COMPOSE_SLEEP", 1.2, float)
 ADB_DISMISS_BACK_TWICE = env("ADB_DISMISS_BACK_TWICE", True, bool)
 
+# ---- ADBKeyBoard / Unicode injection ----
+ADBKEYBOARD_IME = env("ADBKEYBOARD_IME", "com.android.adbkeyboard/.AdbIME")
+ADBKEYBOARD_B64_ACTION = env("ADBKEYBOARD_B64_ACTION", "ADB_INPUT_B64")
+ADBKEYBOARD_B64_EXTRA = env("ADBKEYBOARD_B64_EXTRA", "msg")
+QSB_ACTIVITY = env("QSB_ACTIVITY", "com.android.quicksearchbox/.SearchActivity")
+
+# Existing-thread focus logic
+EXISTING_THREAD_FIRST_BURST_TABS = env("EXISTING_THREAD_FIRST_BURST_TABS", 3, int)
+EXISTING_THREAD_MAX_TABS = env("EXISTING_THREAD_MAX_TABS", 8, int)
+EXISTING_THREAD_FALLBACK_UIA = env("EXISTING_THREAD_FALLBACK_UIA", True, bool)
+
 # ---- Outbound DB correlation ----
 OUTBOUND_DB_POLL_SEC = env("OUTBOUND_DB_POLL_SEC", 0.5, float)
 OUTBOUND_DB_POLL_MAX_SEC = env("OUTBOUND_DB_POLL_MAX_SEC", 12, int)
 OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC = env("OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC", 8, int)
 
+# ---- Retry / backfill controls ----
+INBOUND_MODE = env("INBOUND_MODE", "tail")  # tail | backfill
+INBOUND_BACKFILL_SINCE_EPOCH = env("INBOUND_BACKFILL_SINCE_EPOCH", 0, int)
 
+INBOUND_RETRY_BASE_SEC = env("INBOUND_RETRY_BASE_SEC", 2.0, float)
+INBOUND_RETRY_MAX_SEC = env("INBOUND_RETRY_MAX_SEC", 300.0, float)
+INBOUND_MAX_ATTEMPTS = env("INBOUND_MAX_ATTEMPTS", 30, int)
+
+OUTBOUND_RETRY_BASE_SEC = env("OUTBOUND_RETRY_BASE_SEC", 2.0, float)
+OUTBOUND_RETRY_MAX_SEC = env("OUTBOUND_RETRY_MAX_SEC", 300.0, float)
+OUTBOUND_MAX_ATTEMPTS = env("OUTBOUND_MAX_ATTEMPTS", 30, int)
+
+POST_OUTBOUND_RESULTS = env("POST_OUTBOUND_RESULTS", True, bool)
+
+# ---- Internal ----
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40}
 _CUR_LEVEL = _LEVELS.get(str(LOG_LEVEL).upper(), 20)
+
+_RE_GARMIN_INPUT = re.compile(r"app:id/newMessageInputEditText")
 
 
 def _now_iso() -> str:
@@ -135,6 +170,21 @@ def log(level: str, msg: str, **fields: Any) -> None:
     if fields:
         suffix = " " + " ".join(f"{k}={_safe_kv(v)}" for k, v in fields.items())
     print(f"{_now_iso()} [{level.upper():5}] {msg}{suffix}", flush=True)
+
+
+def _jitter() -> float:
+    return random.uniform(0.0, 0.25)
+
+
+def _backoff(base_sec: float, max_sec: float, attempt: int) -> float:
+    # attempt is 1-based
+    try:
+        a = max(1, int(attempt))
+    except Exception:
+        a = 1
+    sec = base_sec * (2 ** (a - 1))
+    sec = min(float(max_sec), float(sec))
+    return float(sec) + _jitter()
 
 
 def garmin_db_conn() -> sqlite3.Connection:
@@ -179,7 +229,10 @@ CREATE TABLE IF NOT EXISTS inbound_delivery (
     media_attachment_id TEXT,
     acked INTEGER NOT NULL DEFAULT 0,
     delivered_ts INTEGER,
-    last_error TEXT
+    last_error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_ts INTEGER,
+    last_attempt_ts INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS outbound_job (
@@ -195,7 +248,8 @@ CREATE TABLE IF NOT EXISTS outbound_job (
     status TEXT NOT NULL DEFAULT 'queued',
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    result_json TEXT
+    result_json TEXT,
+    next_attempt_ts INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS outbound_unique_event ON outbound_job(matrix_room_id, matrix_event_id);
 
@@ -213,9 +267,36 @@ CREATE TABLE IF NOT EXISTS cursor (
 """
 
 
+def _table_cols(con: sqlite3.Connection, table: str) -> List[str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return [str(r[1]) for r in rows]
+    except Exception:
+        return []
+
+
+def _ensure_migrations(con: sqlite3.Connection) -> None:
+    # Older DBs created by earlier builds won't have new columns.
+    cols = set(_table_cols(con, "inbound_delivery"))
+    if cols:
+        if "attempts" not in cols:
+            con.execute("ALTER TABLE inbound_delivery ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        if "next_attempt_ts" not in cols:
+            con.execute("ALTER TABLE inbound_delivery ADD COLUMN next_attempt_ts INTEGER")
+        if "last_attempt_ts" not in cols:
+            con.execute("ALTER TABLE inbound_delivery ADD COLUMN last_attempt_ts INTEGER")
+
+    cols2 = set(_table_cols(con, "outbound_job"))
+    if cols2 and "next_attempt_ts" not in cols2:
+        con.execute("ALTER TABLE outbound_job ADD COLUMN next_attempt_ts INTEGER")
+
+    con.commit()
+
+
 def init_state() -> None:
     with state_db_conn() as con:
         con.executescript(STATE_SCHEMA)
+        _ensure_migrations(con)
         con.commit()
 
 
@@ -245,6 +326,25 @@ def sha1_hex(s: str) -> str:
 def adb_text_escape(s: str) -> str:
     s = (s or "").replace("\n", " ").replace("\r", " ")
     return s.replace(" ", "%s")
+
+
+# ---- HMAC helpers ----
+
+def _hmac_hexdigest(secret: str, body: bytes) -> str:
+    return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+
+def _hmac_ok(headers: Dict[str, str], body: bytes) -> bool:
+    """
+    If HMAC_SECRET is set, require a valid HMAC header.
+    """
+    if not HMAC_SECRET:
+        return True
+    got = (headers.get(HMAC_HEADER) or headers.get(HMAC_HEADER.lower()) or "").strip()
+    if not got:
+        return False
+    exp = _hmac_hexdigest(HMAC_SECRET, body)
+    return hmac.compare_digest(got, exp)
 
 
 # ---- Proven media scan (attachment_id only) ----
@@ -290,12 +390,14 @@ def _guess_mime(path: Optional[str]) -> str:
     return mt or "application/octet-stream"
 
 
-def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int = 20) -> Tuple[int, str]:
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
+def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int = 20, sign_hmac: bool = True) -> Tuple[int, str]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json; charset=utf-8")
     if bearer:
         req.add_header("Authorization", f"Bearer {bearer}")
+    if sign_hmac and HMAC_SECRET:
+        req.add_header(HMAC_HEADER, _hmac_hexdigest(HMAC_SECRET, body))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         b = resp.read(8192)
         return int(resp.status), b.decode("utf-8", errors="replace")
@@ -348,7 +450,27 @@ def is_acked(delivery_id: str) -> bool:
 def ack_delivery(delivery_id: str) -> None:
     now = int(time.time())
     with state_db_conn() as con:
-        con.execute("UPDATE inbound_delivery SET acked=1, delivered_ts=? WHERE delivery_id=?", (now, delivery_id))
+        con.execute("UPDATE inbound_delivery SET acked=1, delivered_ts=?, last_error=NULL WHERE delivery_id=?", (now, delivery_id))
+        con.commit()
+
+
+def note_delivery_error(delivery_id: str, err: str) -> None:
+    with state_db_conn() as con:
+        con.execute("UPDATE inbound_delivery SET last_error=? WHERE delivery_id=?", (err[:800], delivery_id))
+        con.commit()
+
+
+def schedule_inbound_retry(delivery_id: str, err: str) -> None:
+    now = int(time.time())
+    with state_db_conn() as con:
+        r = con.execute("SELECT attempts FROM inbound_delivery WHERE delivery_id=? LIMIT 1", (delivery_id,)).fetchone()
+        attempts = int(r["attempts"] or 0) + 1 if r else 1
+        delay = _backoff(INBOUND_RETRY_BASE_SEC, INBOUND_RETRY_MAX_SEC, attempts)
+        next_ts = now + int(delay)
+        con.execute(
+            "UPDATE inbound_delivery SET attempts=?, last_attempt_ts=?, next_attempt_ts=?, last_error=? WHERE delivery_id=?",
+            (attempts, now, next_ts, err[:800], delivery_id),
+        )
         con.commit()
 
 
@@ -358,8 +480,8 @@ def upsert_inbound_record(delivery: Dict[str, Any]) -> None:
             """
             INSERT INTO inbound_delivery(
               delivery_id, internet_conversation_id, message_row_id, origin, sent_time, sort_time, from_addr, text,
-              media_attachment_id
-            ) VALUES(?,?,?,?,?,?,?,?,?)
+              media_attachment_id, next_attempt_ts
+            ) VALUES(?,?,?,?,?,?,?,?,?,NULL)
             ON CONFLICT(delivery_id) DO UPDATE SET
               internet_conversation_id=excluded.internet_conversation_id,
               message_row_id=COALESCE(excluded.message_row_id, inbound_delivery.message_row_id),
@@ -408,8 +530,8 @@ def enqueue_outbound(job: Dict[str, Any]) -> int:
             """
             INSERT INTO outbound_job(
               matrix_room_id, matrix_event_id, internet_conversation_id, kind, text, recipients_json,
-              created_ts, updated_ts, status, attempts
-            ) VALUES(?,?,?,?,?,?,?,?, 'queued', 0)
+              created_ts, updated_ts, status, attempts, next_attempt_ts
+            ) VALUES(?,?,?,?,?,?,?,?, 'queued', 0, NULL)
             ON CONFLICT(matrix_room_id, matrix_event_id) DO NOTHING
             """,
             (
@@ -432,19 +554,43 @@ def enqueue_outbound(job: Dict[str, Any]) -> int:
 
 
 def next_outbound_job() -> Optional[sqlite3.Row]:
+    now = int(time.time())
     with state_db_conn() as con:
         return con.execute(
-            "SELECT * FROM outbound_job WHERE status IN ('queued','failed') ORDER BY updated_ts ASC, job_id ASC LIMIT 1"
+            """
+            SELECT *
+            FROM outbound_job
+            WHERE status IN ('queued','failed')
+              AND (next_attempt_ts IS NULL OR next_attempt_ts <= ?)
+            ORDER BY updated_ts ASC, job_id ASC
+            LIMIT 1
+            """,
+            (now,),
         ).fetchone()
 
 
-def update_outbound_job(job_id: int, status: str, error: Optional[str] = None, result: Optional[Dict[str, Any]] = None) -> None:
+def mark_outbound_sending(job_id: int) -> None:
     now = int(time.time())
-    res_json = json.dumps(result, ensure_ascii=False) if result is not None else None
     with state_db_conn() as con:
+        con.execute("UPDATE outbound_job SET status='sending', updated_ts=? WHERE job_id=?", (now, job_id))
+        con.commit()
+
+
+def mark_outbound_failed(job_id: int, err: str) -> None:
+    now = int(time.time())
+    with state_db_conn() as con:
+        r = con.execute("SELECT attempts FROM outbound_job WHERE job_id=? LIMIT 1", (job_id,)).fetchone()
+        attempts = int(r["attempts"] or 0) + 1 if r else 1
+        if attempts >= int(OUTBOUND_MAX_ATTEMPTS):
+            next_ts = None
+            status = "dead"
+        else:
+            delay = _backoff(OUTBOUND_RETRY_BASE_SEC, OUTBOUND_RETRY_MAX_SEC, attempts)
+            next_ts = now + int(delay)
+            status = "failed"
         con.execute(
-            "UPDATE outbound_job SET status=?, updated_ts=?, attempts=attempts+1, last_error=?, result_json=? WHERE job_id=?",
-            (status, now, error, res_json, job_id),
+            "UPDATE outbound_job SET status=?, updated_ts=?, attempts=?, last_error=?, next_attempt_ts=? WHERE job_id=?",
+            (status, now, attempts, err[:800], next_ts, job_id),
         )
         con.commit()
 
@@ -453,7 +599,10 @@ def mark_outbound_sent(job_id: int, result: Optional[Dict[str, Any]] = None) -> 
     now = int(time.time())
     res_json = json.dumps(result, ensure_ascii=False) if result is not None else None
     with state_db_conn() as con:
-        con.execute("UPDATE outbound_job SET status='sent', updated_ts=?, result_json=? WHERE job_id=?", (now, res_json, job_id))
+        con.execute(
+            "UPDATE outbound_job SET status='sent', updated_ts=?, last_error=NULL, result_json=?, next_attempt_ts=NULL WHERE job_id=?",
+            (now, res_json, job_id),
+        )
         con.commit()
 
 
@@ -490,6 +639,13 @@ def adb_shell(cmd: str, timeout: int = 25) -> None:
     return None
 
 
+def adb_shell_out(cmd: str, timeout: int = 25) -> str:
+    p = adb("shell", cmd, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError(f"adb shell failed rc={p.returncode} stderr={p.stderr.decode(errors='replace')[:600]}")
+    return (p.stdout or b"").decode("utf-8", errors="replace")
+
+
 def adb_sleep(sec: float) -> None:
     time.sleep(max(0.0, sec))
 
@@ -501,6 +657,51 @@ def adb_dismiss_overlays() -> None:
         adb_shell("input keyevent 4; input keyevent 4", timeout=10)
     except Exception:
         pass
+
+
+def ensure_adb_connected() -> None:
+    """
+    Make ADB connectivity robust across container restarts.
+    - Start the adb server if needed
+    - Optionally `adb connect $ADB_TARGET` (tcpip)
+    - Verify `adb devices` contains at least one device (or the configured -s serial works)
+    """
+    # Start server (idempotent)
+    try:
+        p = adb("start-server", timeout=15)
+        if p.returncode != 0:
+            log("WARN", "adb start-server failed", stderr=p.stderr.decode(errors="replace")[:200])
+    except Exception as e:
+        log("WARN", "adb start-server exception", err=str(e))
+
+    # If user configured ADB_TARGET, try to connect with retries.
+    if ADB_TARGET:
+        for i in range(1, 8):
+            try:
+                p = adb("connect", str(ADB_TARGET), timeout=15)
+                out = (p.stdout or b"").decode(errors="replace")
+                err = (p.stderr or b"").decode(errors="replace")
+                if p.returncode == 0 and ("connected" in out.lower() or "already connected" in out.lower()):
+                    log("INFO", "adb connected", target=str(ADB_TARGET))
+                    break
+                log("WARN", "adb connect failed", target=str(ADB_TARGET), attempt=i, out=out.strip()[:200], err=err.strip()[:200])
+            except Exception as e:
+                log("WARN", "adb connect exception", target=str(ADB_TARGET), attempt=i, err=str(e))
+            time.sleep(_backoff(0.5, 6.0, i))
+
+    # Verify devices (best-effort)
+    try:
+        p = adb("devices", timeout=15)
+        txt = (p.stdout or b"").decode(errors="replace")
+        if p.returncode != 0:
+            log("WARN", "adb devices failed", stderr=(p.stderr or b"").decode(errors="replace")[:200])
+            return
+        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+        any_device = any("\tdevice" in ln for ln in lines[1:]) if len(lines) >= 2 else False
+        if not any_device and not ADB_SERIAL:
+            log("WARN", "no adb devices attached (yet)", devices=txt.strip()[:400])
+    except Exception as e:
+        log("WARN", "adb devices exception", err=str(e))
 
 
 def ui_dump(path: str = "/sdcard/ui.xml") -> None:
@@ -540,24 +741,133 @@ def start_activity_view(uri: str) -> None:
     adb_shell(f'am start -a android.intent.action.VIEW -d "{uri}" -n {GARMIN_PKG}/{GARMIN_ACT} -f 0x10000000', timeout=25)
 
 
+# ---- ADBKeyBoard / keyevent navigation / focus verification ----
+
+def adb_ime_enable_set() -> None:
+    # Safe to call repeatedly
+    adb_shell(f"ime enable {ADBKEYBOARD_IME}", timeout=15)
+    adb_shell(f"ime set {ADBKEYBOARD_IME}", timeout=15)
+
+
+def adb_qsb_trigger() -> None:
+    # Kick IME via Quick Search Box (run before every outbound send)
+    adb_shell(f"am start --user 0 -n {QSB_ACTIVITY}", timeout=20)
+    adb_sleep(1.0)
+    adb_shell("input keyevent 4", timeout=10)  # BACK
+    adb_sleep(0.2)
+
+
+def adb_b64_input(text: str) -> None:
+    b64 = base64.b64encode((text or "").encode("utf-8")).decode("ascii")
+    adb_shell(f'am broadcast -a {ADBKEYBOARD_B64_ACTION} --es {ADBKEYBOARD_B64_EXTRA} "{b64}"', timeout=20)
+
+
+def keyevent(code: int, sleep_s: float = 0.12) -> None:
+    adb_shell(f"input keyevent {int(code)}", timeout=10)
+    adb_sleep(sleep_s)
+
+
+def nav_tab(n: int, sleep_s: float = 0.08) -> None:
+    for _ in range(int(n)):
+        keyevent(61, sleep_s)
+
+
+def nav_enter(n: int = 1, sleep_s: float = 0.18) -> None:
+    for _ in range(int(n)):
+        keyevent(66, sleep_s)
+
+
+def is_garmin_input_served() -> bool:
+    out = adb_shell_out("dumpsys input_method", timeout=12)
+    return bool(_RE_GARMIN_INPUT.search(out))
+
+
+def focus_existing_thread_input() -> int:
+    """
+    Existing-thread focus strategy:
+    - Run 3x TAB first (configurable) without checking.
+    - Then TAB one-by-one, checking each time.
+    - Fallback to UIA tap (optional) if still not in input after N.
+    Returns the number of TAB keyevents sent (not counting UIA fallback).
+    """
+    tabs = 0
+    max_tabs = max(1, int(EXISTING_THREAD_MAX_TABS))
+    first_burst = max(0, min(int(EXISTING_THREAD_FIRST_BURST_TABS), max_tabs))
+
+    if first_burst:
+        nav_tab(first_burst)
+        tabs += first_burst
+
+    if is_garmin_input_served():
+        return tabs
+
+    while tabs < max_tabs:
+        nav_tab(1)
+        tabs += 1
+        if is_garmin_input_served():
+            return tabs
+
+    if EXISTING_THREAD_FALLBACK_UIA:
+        try:
+            ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/newMessageInputEditText")
+            adb_sleep(0.2)
+            if is_garmin_input_served():
+                return tabs
+        except Exception as e:
+            log("WARN", "existing-thread UIA fallback failed", err=str(e))
+
+    raise RuntimeError(f"Could not focus input after {tabs} TABs")
+
+
 def send_to_existing_thread(thread_id: int, msg: str) -> None:
+    """
+    Improved existing-thread send:
+    - Kick IME (QSB) before every send.
+    - Use TAB navigation + dumpsys input_method verification to reach input.
+    - Inject Unicode via ADBKeyBoard Base64.
+    - Send via TAB + ENTER (as verified).
+    """
     adb_dismiss_overlays()
+
+    # Ensure ADBKeyBoard is available, then kick IME (EVERY send)
+    adb_ime_enable_set()
+    adb_qsb_trigger()
+
     start_activity_view(f"inreach://messageThread/{int(thread_id)}")
     adb_sleep(ADB_DEFAULT_SLEEP)
-    ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/newMessageInputEditText")
-    adb_shell(f'input text "{adb_text_escape(msg)}"', timeout=20)
-    adb_sleep(0.2)
-    ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/sendButton")
+
+    tabs = focus_existing_thread_input()
+    log("INFO", "focused existing-thread input", thread_id=int(thread_id), tabs=tabs)
+
+    adb_b64_input(msg)
+    adb_sleep(0.25)
+
+    # Move to Send button and send
+    nav_tab(1)
+    nav_enter(1)
 
 
 def compose_new_thread_and_send(recipients: List[str], msg: str) -> None:
+    """
+    Keep your existing (UIA-heavy) approach to reliably reach the message input in a new thread (rare path),
+    but use ADBKeyBoard Base64 for the message body and keyevents TAB+ENTER to send.
+    """
     if not recipients:
         raise ValueError("recipients must not be empty")
+
     adb_dismiss_overlays()
+
+    # Ensure ADBKeyBoard is available, then kick IME (EVERY send)
+    adb_ime_enable_set()
+    adb_qsb_trigger()
+
     start_activity_view("inreach://composedevicemessage/")
     adb_sleep(ADB_COMPOSE_SLEEP)
+
     ui_tap_first_garmin_edittext()
+
     for r in recipients:
+        # ASCII-only input for recipient is fine
         adb_shell(f'input text "{adb_text_escape(str(r))}"', timeout=20)
         adb_shell("input keyevent 66", timeout=10)
         adb_sleep(0.3)
@@ -565,10 +875,19 @@ def compose_new_thread_and_send(recipients: List[str], msg: str) -> None:
         adb_sleep(0.2)
         adb_shell("input keyevent 23", timeout=10)
         adb_sleep(0.5)
+
+    # Use existing logic to reach the message input field
     ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/newMessageInputEditText")
-    adb_shell(f'input text "{adb_text_escape(msg)}"', timeout=20)
     adb_sleep(0.2)
-    ui_tap_center_of_node_grep("com.garmin.android.apps.messenger:id/sendButton")
+
+    # Kick IME again right before Base64 inject (still "before every send")
+    adb_qsb_trigger()
+    adb_b64_input(msg)
+    adb_sleep(0.25)
+
+    # Send: TAB -> ENTER
+    nav_tab(1)
+    nav_enter(1)
 
 
 # ---- Outbound correlation ----
@@ -638,8 +957,12 @@ def resolve_thread_id_for_conversation(con: sqlite3.Connection, internet_convers
 # ---- Inbound ----
 
 def compute_delivery_id(row: sqlite3.Row) -> str:
+    # Prefer robust UUID-like identifiers if present
     if row["ota_uuid"]:
         return str(row["ota_uuid"])
+    if "internet_message_id" in row.keys() and row["internet_message_id"]:
+        return str(row["internet_message_id"])
+    # Deterministic fallback (should be rare)
     conv = str(row["internet_conversation_id"] or "")
     mid = str(row["id"])
     sent = str(row["sent_time"] or row["sort_time"] or "")
@@ -653,6 +976,7 @@ def fetch_new_messages(con: sqlite3.Connection, after_sort_time: int, after_id: 
         SELECT
           id,
           message_thread_id,
+          internet_message_id,
           internet_conversation_id,
           origin,
           status,
@@ -678,6 +1002,87 @@ def fetch_new_messages(con: sqlite3.Connection, after_sort_time: int, after_id: 
     return con.execute(q, (after_sort_time, after_sort_time, after_id, TAIL_LIMIT)).fetchall()
 
 
+def fetch_message_by_id(con: sqlite3.Connection, message_id: int) -> Optional[sqlite3.Row]:
+    q = """
+        SELECT
+          id,
+          message_thread_id,
+          internet_message_id,
+          internet_conversation_id,
+          origin,
+          status,
+          web_transfer_state,
+          "from" as from_addr,
+          text,
+          sort_time,
+          sent_time,
+          ota_uuid,
+          media_attachment_id,
+          latitude,
+          longitude,
+          altitude
+        FROM message
+        WHERE id = ?
+        LIMIT 1
+    """
+    return con.execute(q, (int(message_id),)).fetchone()
+
+
+def fetch_backfill_messages(con: sqlite3.Connection, since_epoch: int, limit: int = 500) -> List[sqlite3.Row]:
+    # Backfill oldest-first. If since_epoch is set, bound by sort_time/sent_time >= since.
+    if since_epoch and since_epoch > 0:
+        q = """
+            SELECT
+              id,
+              message_thread_id,
+              internet_message_id,
+              internet_conversation_id,
+              origin,
+              status,
+              web_transfer_state,
+              "from" as from_addr,
+              text,
+              sort_time,
+              sent_time,
+              ota_uuid,
+              media_attachment_id,
+              latitude,
+              longitude,
+              altitude
+            FROM message
+            WHERE internet_conversation_id IS NOT NULL
+              AND (IFNULL(sent_time, sort_time) >= ?)
+            ORDER BY sort_time ASC, id ASC
+            LIMIT ?
+        """
+        return con.execute(q, (int(since_epoch), int(limit))).fetchall()
+
+    q = """
+        SELECT
+          id,
+          message_thread_id,
+          internet_message_id,
+          internet_conversation_id,
+          origin,
+          status,
+          web_transfer_state,
+          "from" as from_addr,
+          text,
+          sort_time,
+          sent_time,
+          ota_uuid,
+          media_attachment_id,
+          latitude,
+          longitude,
+          altitude
+        FROM message
+        WHERE internet_conversation_id IS NOT NULL
+        ORDER BY sort_time ASC, id ASC
+        LIMIT ?
+    """
+    return con.execute(q, (int(limit),)).fetchall()
+
+
 @dataclasses.dataclass
 class PendingMedia:
     delivery_id: str
@@ -688,18 +1093,16 @@ class PendingMedia:
 
 
 def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str) -> bool:
-    conv = r["internet_conversation_id"]
-    link = get_link_by_conversation(str(conv))
-    if not link:
-        log("DEBUG", "unlinked conversation - skip forward", conv=conv, id=r["id"])
-        return False
+    # IMPORTANT: no conversation_link gate; always forward
     if not MAUBOT_WEBHOOK_URL:
         log("WARN", "MAUBOT_WEBHOOK_URL not set; cannot forward", delivery_id=delivery_id)
+        note_delivery_error(delivery_id, "MAUBOT_WEBHOOK_URL not set")
         return False
 
-    room = link["matrix_room_id"]
     origin = int(r["origin"] or 0)
     ota_uuid = r["ota_uuid"]
+    conv = r["internet_conversation_id"]
+    imid = r["internet_message_id"]
 
     attach_id = r["media_attachment_id"]
     media = None
@@ -726,8 +1129,9 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
         "event_type": "bridge_inbound",
         "delivery_id": delivery_id,
         "ota_uuid": str(ota_uuid) if ota_uuid else None,
+        "internet_message_id": str(imid) if imid else None,
         "internet_conversation_id": str(conv),
-        "matrix_room_id": str(room),
+        # NOTE: matrix_room_id intentionally omitted (Maubot maps conv→room)
         "message": {
             "id": int(r["id"]),
             "origin": origin,
@@ -744,19 +1148,75 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
     }
 
     try:
-        code, resp = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20)
+        code, resp = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20, sign_hmac=True)
         if 200 <= code < 300:
-            log("INFO", "forwarded inbound", delivery_id=delivery_id, room=room, code=code)
+            log("INFO", "forwarded inbound", delivery_id=delivery_id, conv=str(conv), code=code, origin=origin)
             return True
         log("WARN", "maubot rejected", delivery_id=delivery_id, code=code, resp=resp[:600])
+        note_delivery_error(delivery_id, f"maubot {code}: {resp[:300]}")
         return False
     except Exception as e:
         log("WARN", "maubot forward failed", delivery_id=delivery_id, err=str(e))
+        note_delivery_error(delivery_id, f"exception: {str(e)[:300]}")
         return False
+
+
+def _due_inbound_deliveries(limit: int = 50) -> List[sqlite3.Row]:
+    now = int(time.time())
+    with state_db_conn() as con:
+        return con.execute(
+            """
+            SELECT *
+            FROM inbound_delivery
+            WHERE acked=0
+              AND attempts < ?
+              AND (next_attempt_ts IS NULL OR next_attempt_ts <= ?)
+            ORDER BY COALESCE(next_attempt_ts,0) ASC, COALESCE(sort_time,0) ASC, COALESCE(message_row_id,0) ASC
+            LIMIT ?
+            """,
+            (int(INBOUND_MAX_ATTEMPTS), now, int(limit)),
+        ).fetchall()
+
+
+def _process_inbound_retry_batch(con_garmin: sqlite3.Connection) -> None:
+    for d in _due_inbound_deliveries(limit=30):
+        did = str(d["delivery_id"])
+        if is_acked(did):
+            continue
+        mid = d["message_row_id"]
+        if mid is None:
+            continue
+        r = fetch_message_by_id(con_garmin, int(mid))
+        if not r:
+            schedule_inbound_retry(did, "message row not found in garmin db")
+            continue
+
+        origin = int(r["origin"] or 0)
+        ota_uuid = r["ota_uuid"]
+        if origin == 0 and ota_uuid:
+            corr = lookup_outbound_by_ota(str(ota_uuid))
+            if corr:
+                log("DEBUG", "echo suppressed", ota_uuid=ota_uuid, matrix_event_id=corr["matrix_event_id"])
+                ack_delivery(did)
+                continue
+
+        attach_id = r["media_attachment_id"]
+        if attach_id:
+            best_path, _ = resolve_media(ROOT_DIR, str(attach_id))
+            if not best_path:
+                schedule_inbound_retry(did, "pending media (not yet on disk)")
+                continue
+
+        ok = forward_to_maubot(con_garmin, r, did)
+        if ok:
+            ack_delivery(did)
+        else:
+            schedule_inbound_retry(did, "maubot delivery failed (retry)")
 
 
 def poll_loop(stop_evt: threading.Event) -> None:
     init_state()
+
     cur = load_cursor("poll_cursor", "0:0")
     try:
         after_sort_time, after_id = [int(x) for x in cur.split(":", 1)]
@@ -764,11 +1224,38 @@ def poll_loop(stop_evt: threading.Event) -> None:
         after_sort_time, after_id = 0, 0
 
     pending: Dict[str, PendingMedia] = {}
-    log("INFO", "poller starting", poll_sec=POLL_DB_SEC, tail_limit=TAIL_LIMIT)
+    do_backfill = str(INBOUND_MODE).strip().lower() == "backfill"
+
+    log("INFO", "poller starting", poll_sec=POLL_DB_SEC, tail_limit=TAIL_LIMIT, inbound_mode=INBOUND_MODE)
 
     while not stop_evt.is_set():
         try:
             with garmin_db_conn() as con:
+                if do_backfill:
+                    rows_bf = fetch_backfill_messages(con, int(INBOUND_BACKFILL_SINCE_EPOCH), limit=500)
+                    if rows_bf:
+                        log("INFO", "backfill batch", n=len(rows_bf), since=INBOUND_BACKFILL_SINCE_EPOCH)
+                        for r in rows_bf:
+                            conv = r["internet_conversation_id"]
+                            if not conv:
+                                continue
+                            delivery_id = compute_delivery_id(r)
+                            upsert_inbound_record({
+                                "delivery_id": delivery_id,
+                                "internet_conversation_id": str(conv),
+                                "message_row_id": int(r["id"]),
+                                "origin": int(r["origin"] or 0),
+                                "sent_time": epoch_s(r["sent_time"]),
+                                "sort_time": epoch_s(r["sort_time"]),
+                                "from": r["from_addr"],
+                                "text": r["text"],
+                                "media_attachment_id": r["media_attachment_id"],
+                            })
+                        do_backfill = False
+                        log("INFO", "backfill queued; switching to tail")
+
+                _process_inbound_retry_batch(con)
+
                 rows = fetch_new_messages(con, after_sort_time, after_id)
                 for r in rows:
                     after_sort_time = int(r["sort_time"] or 0)
@@ -816,6 +1303,8 @@ def poll_loop(stop_evt: threading.Event) -> None:
                     delivered = forward_to_maubot(con, r, delivery_id)
                     if delivered:
                         ack_delivery(delivery_id)
+                    else:
+                        schedule_inbound_retry(delivery_id, "maubot delivery failed (initial)")
 
                 now = time.time()
                 for did, p in list(pending.items()):
@@ -827,6 +1316,8 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         delivered = forward_to_maubot(con, p.row, did)
                         if delivered:
                             ack_delivery(did)
+                        else:
+                            schedule_inbound_retry(did, "maubot delivery failed (pending timeout)")
                         pending.pop(did, None)
                         continue
                     if (now - p.last_scan_ts) < float(PENDING_MEDIA_RESCAN_SEC):
@@ -841,6 +1332,8 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         delivered = forward_to_maubot(con, p.row, did)
                         if delivered:
                             ack_delivery(did)
+                        else:
+                            schedule_inbound_retry(did, "maubot delivery failed (pending resolved)")
                         pending.pop(did, None)
 
         except Exception as e:
@@ -854,11 +1347,11 @@ def poll_loop(stop_evt: threading.Event) -> None:
 # ---- Outbound worker ----
 
 def _emit_outbound_result(event: Dict[str, Any]) -> None:
-    if not MAUBOT_WEBHOOK_URL:
+    if not MAUBOT_WEBHOOK_URL or not POST_OUTBOUND_RESULTS:
         return
     payload = {"event_type": "bridge_outbound_result", **event}
     try:
-        code, _ = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20)
+        code, _ = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20, sign_hmac=True)
         log("DEBUG", "outbound result posted", code=code)
     except Exception as e:
         log("WARN", "outbound result post failed", err=str(e))
@@ -880,20 +1373,32 @@ def outbound_worker(stop_evt: threading.Event) -> None:
             kind = str(job["kind"]).strip()
             conv = job["internet_conversation_id"]
 
-            update_outbound_job(job_id, "sending", None)
+            mark_outbound_sending(job_id)
+
+            ensure_adb_connected()
+
+            # Guard: ensure ADBKeyBoard IME is enabled/set before sending
+            try:
+                adb_ime_enable_set()
+            except Exception as e:
+                log("WARN", "ime enable/set failed (guard)", err=str(e))
 
             with garmin_db_conn() as con_db:
                 if kind == "text":
                     if not conv:
-                        update_outbound_job(job_id, "failed", "internet_conversation_id required for kind=text")
+                        mark_outbound_failed(job_id, "internet_conversation_id required for kind=text")
                         continue
                     thread_id = resolve_thread_id_for_conversation(con_db, str(conv))
                     if not thread_id:
-                        update_outbound_job(job_id, "failed", "Could not resolve message_thread_id for conversation (no messages yet).")
+                        mark_outbound_failed(job_id, "Could not resolve message_thread_id for conversation (no messages yet).")
                         continue
                     before_st, before_id = snapshot_conv_cursor(con_db, str(conv))
                     text = str(job["text"] or "")
-                    send_to_existing_thread(int(thread_id), text)
+                    try:
+                        send_to_existing_thread(int(thread_id), text)
+                    except Exception:
+                        ensure_adb_connected()
+                        raise
 
                     ota_uuid, conv_from_row, msg_row_id = find_new_outgoing_by_text(con_db, str(conv), before_st, before_id, text)
                     result = {
@@ -922,11 +1427,16 @@ def outbound_worker(stop_evt: threading.Event) -> None:
                     except Exception:
                         recipients = []
                     if not isinstance(recipients, list) or not recipients:
-                        update_outbound_job(job_id, "failed", "recipients_json must be a non-empty JSON list")
+                        mark_outbound_failed(job_id, "recipients_json must be a non-empty JSON list")
                         continue
                     text = str(job["text"] or "")
                     before_st0, before_id0 = snapshot_global_cursor(con_db)
-                    compose_new_thread_and_send([str(x) for x in recipients], text)
+                    try:
+                        compose_new_thread_and_send([str(x) for x in recipients], text)
+                    except Exception:
+                        ensure_adb_connected()
+                        raise
+
                     ota_uuid, conv_from_row, msg_row_id = find_new_outgoing_by_text(con_db, None, before_st0, before_id0, text)
 
                     result = {
@@ -951,7 +1461,7 @@ def outbound_worker(stop_evt: threading.Event) -> None:
                     _emit_outbound_result(result)
                     continue
 
-                update_outbound_job(job_id, "failed", f"Unsupported kind: {kind}")
+                mark_outbound_failed(job_id, f"Unsupported kind: {kind}")
 
         except Exception as e:
             log("WARN", "outbound worker error", err=str(e))
@@ -969,9 +1479,14 @@ def _auth_ok(headers: Dict[str, str]) -> bool:
     return auth.startswith("Bearer ") and auth.split(" ", 1)[1].strip() == HTTP_TOKEN
 
 
-def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
+def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
     n = int(handler.headers.get("content-length") or "0")
-    raw = handler.rfile.read(n) if n > 0 else b"{}"
+    return handler.rfile.read(n) if n > 0 else b""
+
+
+def _parse_json(raw: bytes) -> Dict[str, Any]:
+    if not raw:
+        return {}
     try:
         return json.loads(raw.decode("utf-8", errors="replace") or "{}")
     except Exception:
@@ -988,7 +1503,7 @@ def _send(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "garmin-bridge/2.2"
+    server_version = "garmin-bridge/2.4"
 
     def do_GET(self):  # noqa: N802
         if self.path == "/healthz":
@@ -996,11 +1511,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return _send(self, 404, {"ok": False, "error": "not found"})
 
     def do_POST(self):  # noqa: N802
-        if not _auth_ok(dict(self.headers)):
+        headers = dict(self.headers)
+
+        if not _auth_ok(headers):
             return _send(self, 401, {"ok": False, "error": "unauthorized"})
 
+        raw = _read_body(self)
+
+        if not _hmac_ok(headers, raw):
+            return _send(self, 401, {"ok": False, "error": "bad hmac"})
+
+        body = _parse_json(raw)
+
         if self.path == "/link":
-            body = _read_json(self)
             conv = (body.get("internet_conversation_id") or "").strip()
             room = (body.get("matrix_room_id") or "").strip()
             if not conv or not room:
@@ -1010,7 +1533,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return _send(self, 200, {"ok": True})
 
         if self.path == "/outbound/enqueue":
-            body = _read_json(self)
             room = (body.get("matrix_room_id") or "").strip()
             ev = (body.get("matrix_event_id") or "").strip()
             kind = (body.get("kind") or "text").strip()
@@ -1048,7 +1570,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return _send(self, 200, {"ok": True, "job_id": jid, **extra})
 
         if self.path == "/inbound/ack":
-            body = _read_json(self)
             delivery_id = (body.get("delivery_id") or body.get("ota_uuid") or "").strip()
             if not delivery_id:
                 return _send(self, 400, {"ok": False, "error": "delivery_id or ota_uuid required"})
@@ -1057,13 +1578,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         return _send(self, 404, {"ok": False, "error": "not found"})
 
-    def log_message(self, format: str, *args: Any) -> None:
-        log("DEBUG", "http", path=self.path, msg=(format % args))
+    def log_message(self, fmt: str, *args: Any) -> None:
+        try:
+            line = (fmt % args) if args else fmt
+        except Exception:
+            line = fmt
+        log("DEBUG", "http", path=self.path, line=line)
 
 
 def http_server(stop_evt: threading.Event) -> None:
     init_state()
     srv = ThreadingHTTPServer((HTTP_BIND, int(HTTP_PORT)), BridgeHandler)
+    srv.timeout = 1.0
     log("INFO", "http server listening", bind=HTTP_BIND, port=HTTP_PORT)
     while not stop_evt.is_set():
         srv.handle_request()
@@ -1093,6 +1619,15 @@ def validate_env() -> None:
 def main() -> None:
     validate_env()
     init_state()
+
+    ensure_adb_connected()
+
+    # Best-effort: ensure IME is set on startup; outbound path still sets + kicks before every send.
+    try:
+        adb_ime_enable_set()
+        log("INFO", "adbkeyboard ime enabled+set (startup)", ime=ADBKEYBOARD_IME)
+    except Exception as e:
+        log("WARN", "adbkeyboard ime enable/set failed (startup)", err=str(e))
 
     stop_evt = threading.Event()
 

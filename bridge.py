@@ -2,14 +2,25 @@
 """
 Garmin Messenger ↔ Matrix (Maubot) bridge — Hybrid C.
 
-Updates in this version (only what's needed to reflect the proposed improvements):
-- Outbound (existing thread): keyevent TAB navigation + verification via `dumpsys input_method`
-  to ensure we reach `app:id/newMessageInputEditText`, then send Unicode via ADBKeyBoard
-  Base64 broadcast, then TAB+ENTER to send.
-- Outbound (new thread): keep existing UIA logic to reach the message input field (rare path),
-  but use ADBKeyBoard Base64 for message text and TAB+ENTER to send.
-- Kick ADBKeyBoard via Quick Search Box BEFORE EVERY outbound message send.
-- Enable + set ADBKeyBoard IME on startup (best effort) and as a guard before outbound sends.
+This build integrates the agreed upgrades without changing existing behavior
+beyond what is required:
+
+- Start Garmin MainActivity only (no back/overlay-dismiss is required for startup).
+- Robust echo suppression for origin=0 using a persistent mapping:
+    - If origin=0 AND ota_uuid is mapped with source='matrix' => do NOT forward to Maubot (Matrix echo).
+    - Else forward origin=0 messages to Maubot (so locally typed Garmin messages reach Matrix).
+  Plus a small optional fallback using recent_outbound(text-hash) within a time window.
+
+- Persistent mapping store in state.db (fresh DB OK):
+    - /matrix/map_event (Maubot -> bridge) upserts mapping of garmin_ota_uuid -> matrix_event_id, with source=garmin|matrix.
+    - /matrix/lookup and /matrix/lookup_reaction lookups to help Maubot implement reactions safely.
+- Reaction bridging support:
+    - Poll reaction_record join message to emit bridge_inbound_reaction events to Maubot.
+    - Separate inbound_reaction_delivery with retry/backoff and ack.
+- Retry/backoff remains exponential with jitter and max-attempt dead-letter behavior (as before).
+- HTTP log_message bug already fixed.
+
+Everything else is preserved as-is.
 """
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import urllib.request
 import base64
 
@@ -137,6 +148,9 @@ OUTBOUND_RETRY_MAX_SEC = env("OUTBOUND_RETRY_MAX_SEC", 300.0, float)
 OUTBOUND_MAX_ATTEMPTS = env("OUTBOUND_MAX_ATTEMPTS", 30, int)
 
 POST_OUTBOUND_RESULTS = env("POST_OUTBOUND_RESULTS", True, bool)
+
+# ---- Reaction / echo fallback tuning ----
+RECENT_OUTBOUND_WINDOW_SEC = env("RECENT_OUTBOUND_WINDOW_SEC", 180, int)  # best-effort echo suppression window
 
 # ---- Internal ----
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40}
@@ -260,6 +274,50 @@ CREATE TABLE IF NOT EXISTS outbound_correlation (
     created_ts INTEGER NOT NULL
 );
 
+-- New: persistent mapping for echo suppression + reactions
+CREATE TABLE IF NOT EXISTS matrix_event_map (
+  conv_id TEXT NOT NULL,
+  garmin_ota_uuid TEXT NOT NULL,
+  matrix_room_id TEXT NOT NULL,
+  matrix_event_id TEXT NOT NULL,
+  kind TEXT NOT NULL,          -- 'message' | 'reaction'
+  source TEXT NOT NULL,        -- 'garmin' | 'matrix'
+  emoji TEXT,                  -- reaction only
+  target_ota_uuid TEXT,        -- reaction only
+  created_ts INTEGER NOT NULL,
+  PRIMARY KEY (conv_id, garmin_ota_uuid)
+);
+CREATE INDEX IF NOT EXISTS matrix_event_map_target
+  ON matrix_event_map(conv_id, target_ota_uuid, emoji, created_ts);
+
+-- New: inbound reaction deliveries (retry + ack)
+CREATE TABLE IF NOT EXISTS inbound_reaction_delivery (
+  delivery_id TEXT NOT NULL PRIMARY KEY,
+  conv_id TEXT NOT NULL,
+  reaction_ota_uuid TEXT NOT NULL,
+  target_ota_uuid TEXT NOT NULL,
+  operation INTEGER NOT NULL,
+  emoji TEXT NOT NULL,
+  acked INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_ts INTEGER,
+  last_attempt_ts INTEGER,
+  delivered_ts INTEGER,
+  last_error TEXT
+);
+
+-- Optional: best-effort outbound echo suppression by (conv, text hash) within a time window
+CREATE TABLE IF NOT EXISTS recent_outbound (
+  matrix_room_id TEXT NOT NULL,
+  matrix_event_id TEXT NOT NULL,
+  internet_conversation_id TEXT,
+  text_sha1 TEXT,
+  created_ts INTEGER NOT NULL,
+  PRIMARY KEY(matrix_room_id, matrix_event_id)
+);
+CREATE INDEX IF NOT EXISTS recent_outbound_lookup
+  ON recent_outbound(internet_conversation_id, text_sha1, created_ts);
+
 CREATE TABLE IF NOT EXISTS cursor (
     name TEXT NOT NULL PRIMARY KEY,
     value TEXT
@@ -290,6 +348,7 @@ def _ensure_migrations(con: sqlite3.Connection) -> None:
     if cols2 and "next_attempt_ts" not in cols2:
         con.execute("ALTER TABLE outbound_job ADD COLUMN next_attempt_ts INTEGER")
 
+    # New tables are created by schema; no legacy migration required.
     con.commit()
 
 
@@ -441,6 +500,77 @@ def get_link_by_conversation(internet_conversation_id: str) -> Optional[sqlite3.
         return con.execute("SELECT * FROM conversation_link WHERE internet_conversation_id=? LIMIT 1", (internet_conversation_id,)).fetchone()
 
 
+# ---- New: matrix event mapping helpers ----
+
+def upsert_matrix_event_map(
+    conv_id: str,
+    garmin_ota_uuid: str,
+    matrix_room_id: str,
+    matrix_event_id: str,
+    kind: str,
+    source: str,
+    emoji: Optional[str] = None,
+    target_ota_uuid: Optional[str] = None,
+) -> None:
+    now = int(time.time())
+    with state_db_conn() as con:
+        con.execute(
+            """
+            INSERT INTO matrix_event_map(
+              conv_id, garmin_ota_uuid, matrix_room_id, matrix_event_id, kind, source, emoji, target_ota_uuid, created_ts
+            ) VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(conv_id, garmin_ota_uuid) DO UPDATE SET
+              matrix_room_id=excluded.matrix_room_id,
+              matrix_event_id=excluded.matrix_event_id,
+              kind=excluded.kind,
+              source=excluded.source,
+              emoji=excluded.emoji,
+              target_ota_uuid=excluded.target_ota_uuid,
+              created_ts=excluded.created_ts
+            """,
+            (
+                str(conv_id),
+                str(garmin_ota_uuid),
+                str(matrix_room_id),
+                str(matrix_event_id),
+                str(kind),
+                str(source),
+                emoji,
+                target_ota_uuid,
+                now,
+            ),
+        )
+        con.commit()
+
+
+def lookup_matrix_event_for_ota(conv_id: str, garmin_ota_uuid: str) -> Optional[sqlite3.Row]:
+    with state_db_conn() as con:
+        return con.execute(
+            "SELECT * FROM matrix_event_map WHERE conv_id=? AND garmin_ota_uuid=? LIMIT 1",
+            (str(conv_id), str(garmin_ota_uuid)),
+        ).fetchone()
+
+
+def lookup_reaction_event_by_target(conv_id: str, target_ota_uuid: str, emoji: str) -> Optional[sqlite3.Row]:
+    # Return the latest reaction mapping for (target, emoji)
+    with state_db_conn() as con:
+        return con.execute(
+            """
+            SELECT *
+            FROM matrix_event_map
+            WHERE conv_id=?
+              AND kind='reaction'
+              AND target_ota_uuid=?
+              AND emoji=?
+            ORDER BY created_ts DESC
+            LIMIT 1
+            """,
+            (str(conv_id), str(target_ota_uuid), str(emoji)),
+        ).fetchone()
+
+
+# ---- Inbound delivery helpers ----
+
 def is_acked(delivery_id: str) -> bool:
     with state_db_conn() as con:
         r = con.execute("SELECT acked FROM inbound_delivery WHERE delivery_id=? LIMIT 1", (delivery_id,)).fetchone()
@@ -507,6 +637,72 @@ def upsert_inbound_record(delivery: Dict[str, Any]) -> None:
         con.commit()
 
 
+# ---- New: inbound reaction delivery helpers ----
+
+def is_reaction_acked(delivery_id: str) -> bool:
+    with state_db_conn() as con:
+        r = con.execute("SELECT acked FROM inbound_reaction_delivery WHERE delivery_id=? LIMIT 1", (delivery_id,)).fetchone()
+        return bool(r and int(r["acked"] or 0) == 1)
+
+
+def ack_reaction_delivery(delivery_id: str) -> None:
+    now = int(time.time())
+    with state_db_conn() as con:
+        con.execute(
+            "UPDATE inbound_reaction_delivery SET acked=1, delivered_ts=?, last_error=NULL WHERE delivery_id=?",
+            (now, delivery_id),
+        )
+        con.commit()
+
+
+def schedule_reaction_retry(delivery_id: str, err: str) -> None:
+    now = int(time.time())
+    with state_db_conn() as con:
+        r = con.execute("SELECT attempts FROM inbound_reaction_delivery WHERE delivery_id=? LIMIT 1", (delivery_id,)).fetchone()
+        attempts = int(r["attempts"] or 0) + 1 if r else 1
+        delay = _backoff(INBOUND_RETRY_BASE_SEC, INBOUND_RETRY_MAX_SEC, attempts)
+        next_ts = now + int(delay)
+        con.execute(
+            """
+            UPDATE inbound_reaction_delivery
+            SET attempts=?, last_attempt_ts=?, next_attempt_ts=?, last_error=?
+            WHERE delivery_id=?
+            """,
+            (attempts, now, next_ts, err[:800], delivery_id),
+        )
+        con.commit()
+
+
+def upsert_inbound_reaction_record(d: Dict[str, Any]) -> None:
+    # idempotent insert; keep original attempts/next_attempt_ts if already exists
+    with state_db_conn() as con:
+        con.execute(
+            """
+            INSERT INTO inbound_reaction_delivery(
+              delivery_id, conv_id, reaction_ota_uuid, target_ota_uuid, operation, emoji, acked,
+              attempts, next_attempt_ts, last_attempt_ts, delivered_ts, last_error
+            ) VALUES(?,?,?,?,?,?,0,0,NULL,NULL,NULL,NULL)
+            ON CONFLICT(delivery_id) DO UPDATE SET
+              conv_id=excluded.conv_id,
+              reaction_ota_uuid=excluded.reaction_ota_uuid,
+              target_ota_uuid=excluded.target_ota_uuid,
+              operation=excluded.operation,
+              emoji=excluded.emoji
+            """,
+            (
+                d["delivery_id"],
+                d["conv_id"],
+                d["reaction_ota_uuid"],
+                d["target_ota_uuid"],
+                int(d["operation"]),
+                d["emoji"],
+            ),
+        )
+        con.commit()
+
+
+# ---- Outbound correlation (existing) ----
+
 def add_outbound_correlation(ota_uuid: str, matrix_room_id: str, matrix_event_id: str) -> None:
     now = int(time.time())
     with state_db_conn() as con:
@@ -522,6 +718,53 @@ def lookup_outbound_by_ota(ota_uuid: str) -> Optional[sqlite3.Row]:
     with state_db_conn() as con:
         return con.execute("SELECT * FROM outbound_correlation WHERE ota_uuid=? LIMIT 1", (ota_uuid,)).fetchone()
 
+
+# ---- Optional: recent outbound (echo fallback) ----
+
+def record_recent_outbound(matrix_room_id: str, matrix_event_id: str, conv_id: Optional[str], text: Optional[str]) -> None:
+    now = int(time.time())
+    txt = (text or "").strip()
+    tsh = sha1_hex(txt) if txt else None
+    with state_db_conn() as con:
+        con.execute(
+            """
+            INSERT INTO recent_outbound(matrix_room_id, matrix_event_id, internet_conversation_id, text_sha1, created_ts)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(matrix_room_id, matrix_event_id) DO UPDATE SET
+              internet_conversation_id=excluded.internet_conversation_id,
+              text_sha1=excluded.text_sha1,
+              created_ts=excluded.created_ts
+            """,
+            (str(matrix_room_id), str(matrix_event_id), (str(conv_id) if conv_id else None), tsh, now),
+        )
+        con.commit()
+
+
+def is_recent_outbound_echo(conv_id: str, text: str) -> bool:
+    conv = (conv_id or "").strip()
+    txt = (text or "").strip()
+    if not conv or not txt:
+        return False
+    tsh = sha1_hex(txt)
+    now = int(time.time())
+    cutoff = now - int(RECENT_OUTBOUND_WINDOW_SEC)
+    with state_db_conn() as con:
+        r = con.execute(
+            """
+            SELECT 1
+            FROM recent_outbound
+            WHERE internet_conversation_id=?
+              AND text_sha1=?
+              AND created_ts >= ?
+            ORDER BY created_ts DESC
+            LIMIT 1
+            """,
+            (conv, tsh, cutoff),
+        ).fetchone()
+        return bool(r)
+
+
+# ---- Outbound queue (existing) ----
 
 def enqueue_outbound(job: Dict[str, Any]) -> int:
     now = int(time.time())
@@ -550,7 +793,21 @@ def enqueue_outbound(job: Dict[str, Any]) -> int:
             "SELECT job_id FROM outbound_job WHERE matrix_room_id=? AND matrix_event_id=? LIMIT 1",
             (job["matrix_room_id"], job["matrix_event_id"]),
         ).fetchone()
-        return int(r["job_id"]) if r else 0
+
+        jid = int(r["job_id"]) if r else 0
+
+    # Record recent outbound (best-effort echo fallback)
+    try:
+        record_recent_outbound(
+            str(job["matrix_room_id"]),
+            str(job["matrix_event_id"]),
+            job.get("internet_conversation_id"),
+            job.get("text"),
+        )
+    except Exception:
+        pass
+
+    return jid
 
 
 def next_outbound_job() -> Optional[sqlite3.Row]:
@@ -739,6 +996,11 @@ input tap $x $y
 
 def start_activity_view(uri: str) -> None:
     adb_shell(f'am start -a android.intent.action.VIEW -d "{uri}" -n {GARMIN_PKG}/{GARMIN_ACT} -f 0x10000000', timeout=25)
+
+
+def start_garmin_main_activity() -> None:
+    # Start Garmin main activity only (no overlay dismiss required)
+    adb_shell(f"am start --user 0 -n {GARMIN_PKG}/{GARMIN_ACT}", timeout=25)
 
 
 # ---- ADBKeyBoard / keyevent navigation / focus verification ----
@@ -1083,6 +1345,34 @@ def fetch_backfill_messages(con: sqlite3.Connection, since_epoch: int, limit: in
     return con.execute(q, (int(limit),)).fetchall()
 
 
+# ---- New: Reactions polling ----
+
+def fetch_new_reactions(con: sqlite3.Connection, after_sort_time: int, after_id: int) -> List[sqlite3.Row]:
+    q = """
+    SELECT
+      rm.id                       AS reaction_msg_row_id,
+      rm.ota_uuid                 AS reaction_ota_uuid,
+      rm.internet_conversation_id AS conv_id,
+      rm.origin                   AS reaction_origin,
+      rm.sort_time                AS reaction_sort_time,
+      rr.operation                AS operation,
+      rr.emoji                    AS emoji,
+      rr.target_message_id        AS target_msg_row_id,
+      tm.ota_uuid                 AS target_ota_uuid
+    FROM message rm
+    JOIN reaction_record rr ON rr.reaction_message_id = rm.id
+    JOIN message tm ON tm.id = rr.target_message_id
+    WHERE rm.internet_conversation_id IS NOT NULL
+      AND (
+            rm.sort_time > ?
+         OR (rm.sort_time = ? AND rm.id > ?)
+      )
+    ORDER BY rm.sort_time ASC, rm.id ASC
+    LIMIT ?
+    """
+    return con.execute(q, (after_sort_time, after_sort_time, after_id, TAIL_LIMIT)).fetchall()
+
+
 @dataclasses.dataclass
 class PendingMedia:
     delivery_id: str
@@ -1090,6 +1380,25 @@ class PendingMedia:
     first_seen_ts: float
     last_scan_ts: float
     attempts: int
+
+
+def _is_matrix_echo_origin0(conv: str, ota_uuid: Optional[str], text: Optional[str]) -> bool:
+    """
+    Echo suppression policy for origin=0 messages:
+      1) Strong: if mapping exists for ota_uuid with source='matrix' => echo
+      2) Weak fallback: if recent_outbound matches (conv + text hash) within a short window => echo
+    """
+    if ota_uuid:
+        m = lookup_matrix_event_for_ota(str(conv), str(ota_uuid))
+        if m and str(m["source"] or "").lower() == "matrix":
+            return True
+    # fallback (best-effort)
+    try:
+        if conv and text and is_recent_outbound_echo(str(conv), str(text)):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str) -> bool:
@@ -1161,6 +1470,35 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
         return False
 
 
+def forward_reaction_to_maubot(conv_id: str, reaction_ota_uuid: str, target_ota_uuid: str, emoji: str, operation: int, reaction_sort_time: Optional[int]) -> bool:
+    if not MAUBOT_WEBHOOK_URL:
+        return False
+
+    payload = {
+        "event_type": "bridge_inbound_reaction",
+        "delivery_id": str(reaction_ota_uuid),
+        "internet_conversation_id": str(conv_id),
+        "reaction": {
+            "reaction_ota_uuid": str(reaction_ota_uuid),
+            "target_ota_uuid": str(target_ota_uuid),
+            "emoji": str(emoji),
+            "operation": int(operation),
+            "reaction_sort_time": int(reaction_sort_time or 0),
+        },
+    }
+
+    try:
+        code, resp = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20, sign_hmac=True)
+        if 200 <= code < 300:
+            log("INFO", "forwarded reaction", conv=str(conv_id), reaction_ota=str(reaction_ota_uuid), op=int(operation), emoji=str(emoji))
+            return True
+        log("WARN", "maubot rejected reaction", conv=str(conv_id), code=code, resp=resp[:400])
+        return False
+    except Exception as e:
+        log("WARN", "maubot reaction forward failed", err=str(e), conv=str(conv_id), reaction_ota=str(reaction_ota_uuid))
+        return False
+
+
 def _due_inbound_deliveries(limit: int = 50) -> List[sqlite3.Row]:
     now = int(time.time())
     with state_db_conn() as con:
@@ -1172,6 +1510,23 @@ def _due_inbound_deliveries(limit: int = 50) -> List[sqlite3.Row]:
               AND attempts < ?
               AND (next_attempt_ts IS NULL OR next_attempt_ts <= ?)
             ORDER BY COALESCE(next_attempt_ts,0) ASC, COALESCE(sort_time,0) ASC, COALESCE(message_row_id,0) ASC
+            LIMIT ?
+            """,
+            (int(INBOUND_MAX_ATTEMPTS), now, int(limit)),
+        ).fetchall()
+
+
+def _due_reaction_deliveries(limit: int = 50) -> List[sqlite3.Row]:
+    now = int(time.time())
+    with state_db_conn() as con:
+        return con.execute(
+            """
+            SELECT *
+            FROM inbound_reaction_delivery
+            WHERE acked=0
+              AND attempts < ?
+              AND (next_attempt_ts IS NULL OR next_attempt_ts <= ?)
+            ORDER BY COALESCE(next_attempt_ts,0) ASC
             LIMIT ?
             """,
             (int(INBOUND_MAX_ATTEMPTS), now, int(limit)),
@@ -1192,11 +1547,11 @@ def _process_inbound_retry_batch(con_garmin: sqlite3.Connection) -> None:
             continue
 
         origin = int(r["origin"] or 0)
+        conv = str(r["internet_conversation_id"] or "")
         ota_uuid = r["ota_uuid"]
-        if origin == 0 and ota_uuid:
-            corr = lookup_outbound_by_ota(str(ota_uuid))
-            if corr:
-                log("DEBUG", "echo suppressed", ota_uuid=ota_uuid, matrix_event_id=corr["matrix_event_id"])
+        if origin == 0 and conv:
+            if _is_matrix_echo_origin0(conv, str(ota_uuid) if ota_uuid else None, r["text"]):
+                log("DEBUG", "echo suppressed (retry)", conv=conv, ota_uuid=str(ota_uuid or ""))
                 ack_delivery(did)
                 continue
 
@@ -1212,6 +1567,25 @@ def _process_inbound_retry_batch(con_garmin: sqlite3.Connection) -> None:
             ack_delivery(did)
         else:
             schedule_inbound_retry(did, "maubot delivery failed (retry)")
+
+
+def _process_reaction_retry_batch() -> None:
+    for d in _due_reaction_deliveries(limit=30):
+        did = str(d["delivery_id"])
+        if is_reaction_acked(did):
+            continue
+
+        conv_id = str(d["conv_id"])
+        reaction_ota = str(d["reaction_ota_uuid"])
+        target_ota = str(d["target_ota_uuid"])
+        emoji = str(d["emoji"])
+        op = int(d["operation"] or 0)
+
+        ok = forward_reaction_to_maubot(conv_id, reaction_ota, target_ota, emoji, op, None)
+        if ok:
+            ack_reaction_delivery(did)
+        else:
+            schedule_reaction_retry(did, "maubot reaction delivery failed (retry)")
 
 
 def poll_loop(stop_evt: threading.Event) -> None:
@@ -1255,7 +1629,9 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         log("INFO", "backfill queued; switching to tail")
 
                 _process_inbound_retry_batch(con)
+                _process_reaction_retry_batch()
 
+                # 1) normal messages
                 rows = fetch_new_messages(con, after_sort_time, after_id)
                 for r in rows:
                     after_sort_time = int(r["sort_time"] or 0)
@@ -1285,10 +1661,13 @@ def poll_loop(stop_evt: threading.Event) -> None:
 
                     origin = int(r["origin"] or 0)
                     ota_uuid = r["ota_uuid"]
-                    if origin == 0 and ota_uuid:
-                        corr = lookup_outbound_by_ota(str(ota_uuid))
-                        if corr:
-                            log("DEBUG", "echo suppressed", ota_uuid=ota_uuid, matrix_event_id=corr["matrix_event_id"])
+
+                    # NEW: origin=0 handling:
+                    # - if it's a Matrix echo => suppress
+                    # - otherwise forward to Maubot (so local Garmin typed messages reach Matrix)
+                    if origin == 0:
+                        if _is_matrix_echo_origin0(str(conv), str(ota_uuid) if ota_uuid else None, r["text"]):
+                            log("DEBUG", "echo suppressed", conv=str(conv), ota_uuid=str(ota_uuid or ""))
                             ack_delivery(delivery_id)
                             continue
 
@@ -1306,6 +1685,46 @@ def poll_loop(stop_evt: threading.Event) -> None:
                     else:
                         schedule_inbound_retry(delivery_id, "maubot delivery failed (initial)")
 
+                # 2) reactions (separate query, same cursor semantics)
+                rrows = fetch_new_reactions(con, after_sort_time, after_id)
+                for rr in rrows:
+                    # advance cursor to reaction rm.sort_time/id
+                    rst = int(rr["reaction_sort_time"] or 0)
+                    rid = int(rr["reaction_msg_row_id"] or 0)
+                    if (rst > after_sort_time) or (rst == after_sort_time and rid > after_id):
+                        after_sort_time = rst
+                        after_id = rid
+                        save_cursor("poll_cursor", f"{after_sort_time}:{after_id}")
+
+                    conv_id = rr["conv_id"]
+                    reaction_ota = rr["reaction_ota_uuid"]
+                    target_ota = rr["target_ota_uuid"]
+                    emoji = rr["emoji"]
+                    op = int(rr["operation"] or 0)
+
+                    if not conv_id or not reaction_ota or not target_ota or not emoji:
+                        continue
+
+                    did = str(reaction_ota)
+                    upsert_inbound_reaction_record({
+                        "delivery_id": did,
+                        "conv_id": str(conv_id),
+                        "reaction_ota_uuid": str(reaction_ota),
+                        "target_ota_uuid": str(target_ota),
+                        "operation": int(op),
+                        "emoji": str(emoji),
+                    })
+
+                    if is_reaction_acked(did):
+                        continue
+
+                    ok = forward_reaction_to_maubot(str(conv_id), str(reaction_ota), str(target_ota), str(emoji), int(op), int(rr["reaction_sort_time"] or 0))
+                    if ok:
+                        ack_reaction_delivery(did)
+                    else:
+                        schedule_reaction_retry(did, "maubot reaction delivery failed (initial)")
+
+                # pending media resolution (unchanged)
                 now = time.time()
                 for did, p in list(pending.items()):
                     if is_acked(did):
@@ -1413,6 +1832,18 @@ def outbound_worker(stop_evt: threading.Event) -> None:
                     }
                     if ota_uuid:
                         add_outbound_correlation(str(ota_uuid), room, ev)
+                        # NEW: record mapping for echo suppression as source='matrix'
+                        try:
+                            upsert_matrix_event_map(
+                                conv_id=str(conv_from_row or conv),
+                                garmin_ota_uuid=str(ota_uuid),
+                                matrix_room_id=room,
+                                matrix_event_id=ev,
+                                kind="message",
+                                source="matrix",
+                            )
+                        except Exception:
+                            pass
                         log("INFO", "outbound correlated", job_id=job_id, ota_uuid=str(ota_uuid))
                     else:
                         log("WARN", "outbound correlation failed", job_id=job_id)
@@ -1451,8 +1882,20 @@ def outbound_worker(stop_evt: threading.Event) -> None:
                     }
                     if conv_from_row:
                         upsert_link(str(conv_from_row), room)
-                    if ota_uuid:
+                    if ota_uuid and conv_from_row:
                         add_outbound_correlation(str(ota_uuid), room, ev)
+                        # NEW: record mapping for echo suppression as source='matrix'
+                        try:
+                            upsert_matrix_event_map(
+                                conv_id=str(conv_from_row),
+                                garmin_ota_uuid=str(ota_uuid),
+                                matrix_room_id=room,
+                                matrix_event_id=ev,
+                                kind="message",
+                                source="matrix",
+                            )
+                        except Exception:
+                            pass
                         log("INFO", "new_thread correlated", job_id=job_id, ota_uuid=str(ota_uuid), conv=str(conv_from_row))
                     else:
                         log("WARN", "new_thread correlation failed", job_id=job_id)
@@ -1502,12 +1945,72 @@ def _send(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -
     handler.wfile.write(b)
 
 
+def _parse_query(path: str) -> Tuple[str, Dict[str, List[str]]]:
+    u = urlparse(path)
+    return u.path, parse_qs(u.query or "")
+
+
+def _ack_any_delivery(delivery_id: str) -> bool:
+    """
+    For convenience and backwards compatibility:
+    - /inbound/ack will ack message deliveries if present
+    - else ack reaction deliveries if present
+    """
+    did = (delivery_id or "").strip()
+    if not did:
+        return False
+    with state_db_conn() as con:
+        r1 = con.execute("SELECT 1 FROM inbound_delivery WHERE delivery_id=? LIMIT 1", (did,)).fetchone()
+        if r1:
+            now = int(time.time())
+            con.execute("UPDATE inbound_delivery SET acked=1, delivered_ts=?, last_error=NULL WHERE delivery_id=?", (now, did))
+            con.commit()
+            return True
+        r2 = con.execute("SELECT 1 FROM inbound_reaction_delivery WHERE delivery_id=? LIMIT 1", (did,)).fetchone()
+        if r2:
+            now = int(time.time())
+            con.execute("UPDATE inbound_reaction_delivery SET acked=1, delivered_ts=?, last_error=NULL WHERE delivery_id=?", (now, did))
+            con.commit()
+            return True
+    return False
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "garmin-bridge/2.4"
+    server_version = "garmin-bridge/2.5"
 
     def do_GET(self):  # noqa: N802
-        if self.path == "/healthz":
+        path, qs = _parse_query(self.path)
+
+        if path == "/healthz":
             return _send(self, 200, {"ok": True})
+
+        # Lookup mapping for a Garmin message ota_uuid -> Matrix event
+        if path == "/matrix/lookup":
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+            conv = (qs.get("conv") or qs.get("internet_conversation_id") or [""])[0].strip()
+            ota = (qs.get("ota") or qs.get("garmin_ota_uuid") or [""])[0].strip()
+            if not conv or not ota:
+                return _send(self, 400, {"ok": False, "error": "conv and ota required"})
+            r = lookup_matrix_event_for_ota(conv, ota)
+            if not r:
+                return _send(self, 404, {"ok": False, "error": "not found"})
+            return _send(self, 200, {"ok": True, "matrix_room_id": r["matrix_room_id"], "matrix_event_id": r["matrix_event_id"], "kind": r["kind"], "source": r["source"]})
+
+        # Lookup latest reaction event for (target_ota_uuid, emoji) in a conversation
+        if path == "/matrix/lookup_reaction":
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+            conv = (qs.get("conv") or qs.get("internet_conversation_id") or [""])[0].strip()
+            target = (qs.get("target_ota") or qs.get("target_ota_uuid") or [""])[0].strip()
+            emoji = (qs.get("emoji") or [""])[0]
+            if not conv or not target or not emoji:
+                return _send(self, 400, {"ok": False, "error": "conv, target_ota and emoji required"})
+            r = lookup_reaction_event_by_target(conv, target, emoji)
+            if not r:
+                return _send(self, 404, {"ok": False, "error": "not found"})
+            return _send(self, 200, {"ok": True, "matrix_room_id": r["matrix_room_id"], "reaction_event_id": r["matrix_event_id"], "reaction_ota_uuid": r["garmin_ota_uuid"]})
+
         return _send(self, 404, {"ok": False, "error": "not found"})
 
     def do_POST(self):  # noqa: N802
@@ -1530,6 +2033,40 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return _send(self, 400, {"ok": False, "error": "internet_conversation_id and matrix_room_id required"})
             upsert_link(conv, room)
             log("INFO", "linked conversation", conv=conv, room=room)
+            return _send(self, 200, {"ok": True})
+
+        # NEW: Maubot -> bridge mapping callback
+        if self.path == "/matrix/map_event":
+            conv = (body.get("internet_conversation_id") or body.get("conv_id") or "").strip()
+            ota = (body.get("garmin_ota_uuid") or body.get("ota_uuid") or "").strip()
+            room = (body.get("matrix_room_id") or "").strip()
+            ev = (body.get("matrix_event_id") or "").strip()
+            kind = (body.get("kind") or "message").strip()
+            source = (body.get("source") or body.get("from_matrix") or "").strip()
+
+            # normalize source
+            if isinstance(source, str):
+                s = source.lower()
+                if s in ("1", "true", "yes", "on", "matrix"):
+                    source = "matrix"
+                elif s in ("0", "false", "no", "off", "garmin"):
+                    source = "garmin"
+                elif not s:
+                    source = "garmin"
+            else:
+                source = "garmin"
+
+            emoji = body.get("emoji")
+            target_ota = body.get("target_ota_uuid")
+
+            if not conv or not ota or not room or not ev:
+                return _send(self, 400, {"ok": False, "error": "internet_conversation_id, garmin_ota_uuid, matrix_room_id, matrix_event_id required"})
+
+            try:
+                upsert_matrix_event_map(conv, ota, room, ev, kind=kind, source=str(source), emoji=(str(emoji) if emoji is not None else None), target_ota_uuid=(str(target_ota) if target_ota is not None else None))
+            except Exception as e:
+                return _send(self, 500, {"ok": False, "error": f"db error: {str(e)[:200]}"})
+
             return _send(self, 200, {"ok": True})
 
         if self.path == "/outbound/enqueue":
@@ -1573,8 +2110,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             delivery_id = (body.get("delivery_id") or body.get("ota_uuid") or "").strip()
             if not delivery_id:
                 return _send(self, 400, {"ok": False, "error": "delivery_id or ota_uuid required"})
-            ack_delivery(delivery_id)
-            return _send(self, 200, {"ok": True})
+            ok = _ack_any_delivery(delivery_id)
+            return _send(self, 200 if ok else 404, {"ok": bool(ok)})
 
         return _send(self, 404, {"ok": False, "error": "not found"})
 
@@ -1621,6 +2158,13 @@ def main() -> None:
     init_state()
 
     ensure_adb_connected()
+
+    # Start Garmin main activity only (per requirement)
+    try:
+        start_garmin_main_activity()
+        log("INFO", "garmin main activity started", pkg=GARMIN_PKG, act=GARMIN_ACT)
+    except Exception as e:
+        log("WARN", "failed to start garmin main activity", err=str(e))
 
     # Best-effort: ensure IME is set on startup; outbound path still sets + kicks before every send.
     try:

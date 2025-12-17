@@ -2485,7 +2485,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             room = (body.get("matrix_room_id") or "").strip()
             ev = (body.get("matrix_event_id") or "").strip()
             kind = (body.get("kind") or "message").strip()
-            source = (body.get("source") or body.get("from_matrix") or "").strip()
 
             # normalize source
             # All calls to this endpoint originate from Matrix (Maubot)

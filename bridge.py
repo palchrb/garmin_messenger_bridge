@@ -1307,13 +1307,34 @@ def compose_new_thread_and_send(recipients: List[str], msg: str) -> None:
 # ---- Outbound correlation ----
 
 def snapshot_conv_cursor(con: sqlite3.Connection, internet_conversation_id: str) -> Tuple[int, int]:
-    r = con.execute("SELECT IFNULL(MAX(sort_time),0) AS st, IFNULL(MAX(id),0) AS mid FROM message WHERE internet_conversation_id = ?", (internet_conversation_id,)).fetchone()
-    return (int(r["st"] or 0), int(r["mid"] or 0))
+    r = con.execute(
+        """
+        SELECT sort_time, id
+        FROM message
+        WHERE internet_conversation_id = ?
+        ORDER BY sort_time DESC, id DESC
+        LIMIT 1
+        """,
+        (internet_conversation_id,),
+    ).fetchone()
+    if not r:
+        return (0, 0)
+    return (int(r["sort_time"] or 0), int(r["id"] or 0))
 
 
 def snapshot_global_cursor(con: sqlite3.Connection) -> Tuple[int, int]:
-    r = con.execute("SELECT IFNULL(MAX(sort_time),0) AS st, IFNULL(MAX(id),0) AS mid FROM message").fetchone()
-    return (int(r["st"] or 0), int(r["mid"] or 0))
+    r = con.execute(
+        """
+        SELECT sort_time, id
+        FROM message
+        ORDER BY sort_time DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not r:
+        return (0, 0)
+    return (int(r["sort_time"] or 0), int(r["id"] or 0))
+
 
 
 def find_new_outgoing_by_text(con: sqlite3.Connection, internet_conversation_id: Optional[str], after_sort_time: int, after_id: int, text: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
@@ -1793,6 +1814,7 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
                                 "mimetype": mimetype,
                             })
                             log("INFO", "media uploaded to maubot", delivery_id=delivery_id, code=code, filename=filename)
+                            return True
                         else:
                             log("WARN", "maubot media upload rejected", delivery_id=delivery_id, code=code, resp=resp[:600])
                             # Continue to send inbound event (text still useful)
@@ -1803,7 +1825,18 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
             # Your pending-media loop will retry when file appears
             log("DEBUG", "media not yet on disk (pending/retry will handle)", delivery_id=delivery_id, attachment_id=str(attach_id))
 
-    # --- Now forward the main inbound event (no bytes embedded) ---
+    # upload + posting message. Therefore do NOT emit a separate bridge_inbound event.
+    if attach_id:
+        # If we got here, either:
+        # - media upload succeeded already and returned True (we returned above), OR
+        # - media wasn't ready / upload failed and we fall through.
+        #
+        # In Model A we do not send a text-only bridge_inbound for media messages,
+        # because that would duplicate the message (or create split events).
+        note_delivery_error(delivery_id, "media upload not completed (model A); waiting/retry")
+        return False
+
+    # No attachment => normal inbound event
     payload = {
         "event_type": "bridge_inbound",
         "delivery_id": str(delivery_id),
@@ -1820,8 +1853,8 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
             "longitude": r["longitude"],
             "altitude": r["altitude"],
         },
-        "media_attachment_id": str(attach_id) if attach_id else None,
-        "media_ref": media_ref,
+        "media_attachment_id": None,
+        "media_ref": None,
     }
 
     try:
@@ -1844,8 +1877,6 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
         log("WARN", "maubot forward failed", delivery_id=delivery_id, err=str(e))
         note_delivery_error(delivery_id, f"exception: {str(e)[:300]}")
         return False
-
-
 
 
 def forward_reaction_to_maubot(conv_id: str, reaction_ota_uuid: str, target_ota_uuid: str, emoji: str, operation: int, reaction_sort_time: Optional[int]) -> bool:
@@ -2487,8 +2518,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             kind = (body.get("kind") or "message").strip()
 
             # normalize source
-            # All calls to this endpoint originate from Matrix (Maubot)
-            source = "matrix"
+            source = (body.get("source") or "").strip()
+
+            if isinstance(source, str):
+                s = source.lower()
+                if s in ("matrix", "1", "true", "yes", "on"):
+                    source = "matrix"
+                elif s in ("garmin", "0", "false", "no", "off"):
+                    source = "garmin"
+                elif not s:
+                    source = "matrix"
+            else:
+                source = "matrix"
+
 
             emoji = body.get("emoji")
             target_ota = body.get("target_ota_uuid")

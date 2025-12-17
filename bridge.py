@@ -458,8 +458,15 @@ def _guess_mime(path: Optional[str]) -> str:
     mt, _ = mimetypes.guess_type(path)
     return mt or "application/octet-stream"
 
+import urllib.error
 
-def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int = 20, sign_hmac: bool = True) -> Tuple[int, str]:
+def post_json(
+    url: str,
+    payload: Dict[str, Any],
+    bearer: str = "",
+    timeout: int = 20,
+    sign_hmac: bool = True
+) -> Tuple[int, str]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json; charset=utf-8")
@@ -467,9 +474,26 @@ def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int 
         req.add_header("Authorization", f"Bearer {bearer}")
     if sign_hmac and HMAC_SECRET:
         req.add_header(HMAC_HEADER, _hmac_hexdigest(HMAC_SECRET, body))
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        b = resp.read(8192)
-        return int(resp.status), b.decode("utf-8", errors="replace")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            b = resp.read(8192)
+            return int(getattr(resp, "status", 200)), b.decode("utf-8", errors="replace")
+
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx: keep status + body for logging/diagnostics
+        try:
+            b = e.read(8192)
+        except Exception:
+            b = b""
+        return int(getattr(e, "code", 0) or 0), b.decode("utf-8", errors="replace") or str(e)
+
+    except urllib.error.URLError as e:
+        # DNS/timeout/connection refused, etc. No HTTP status available.
+        return 0, f"URLError: {e}"
+    except Exception as e:
+        return 0, f"Exception: {e}"
+
 
 def post_json_idem(
     url: str,
@@ -2179,12 +2203,8 @@ def poll_loop(stop_evt: threading.Event) -> None:
                         continue
 
                     if (now - p.first_seen_ts) > float(PENDING_MEDIA_MAX_SEC) or p.attempts >= int(PENDING_MEDIA_MAX_ATTEMPTS):
-                        log("WARN", "pending media timeout; forwarding anyway", delivery_id=did, attempts=p.attempts)
-                        delivered = forward_to_maubot(con, p.row, did)
-                        if delivered:
-                            ack_delivery(did)
-                        else:
-                            schedule_inbound_retry(did, "maubot delivery failed (pending timeout)")
+                        log("WARN", "pending media timeout; cannot forward without bytes in model A", delivery_id=did, attempts=p.attempts)
+                        schedule_inbound_retry(did, "pending media timeout (model A): file never appeared")
                         pending.pop(did, None)
                         continue
 

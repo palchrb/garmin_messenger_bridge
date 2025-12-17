@@ -21,6 +21,14 @@ beyond what is required:
 - HTTP log_message bug already fixed.
 
 Everything else is preserved as-is.
+
+2025-12-17 upgrades (per your request, minimal behavioral change):
+- First-run hygiene (only once): if BACKFILL=0, ack any preexisting inbound_delivery / inbound_reaction_delivery rows
+  to prevent the retry loop from replaying historical items. Restarts retain normal retry semantics.
+- Separate cursors: poll_cursor (messages) and reaction_cursor (reactions) to avoid missing reactions when messages advance.
+- Avoid duplicate “reaction messages” being forwarded as normal messages by excluding reaction_record-backed rows (with a safe fallback).
+- Stronger “optional fallback” echo suppression: if no conv-matched recent_outbound, allow a conservative global text-hash match
+  (only when it is unambiguous within the window).
 """
 
 from __future__ import annotations
@@ -317,6 +325,8 @@ CREATE TABLE IF NOT EXISTS recent_outbound (
 );
 CREATE INDEX IF NOT EXISTS recent_outbound_lookup
   ON recent_outbound(internet_conversation_id, text_sha1, created_ts);
+CREATE INDEX IF NOT EXISTS recent_outbound_text_global
+  ON recent_outbound(text_sha1, created_ts);
 
 CREATE TABLE IF NOT EXISTS cursor (
     name TEXT NOT NULL PRIMARY KEY,
@@ -534,6 +544,60 @@ def _bootstrap_cursor(con: sqlite3.Connection, backfill_n: int) -> Tuple[int, in
         return int(row["sort_time"] or 0), int(row["id"] or 0)
 
     return 0, 0
+
+
+# ---- First-run hygiene (only once) ----
+
+def _first_run_key() -> str:
+    return "bootstrap_done_v1"
+
+
+def _is_first_run() -> bool:
+    return load_cursor(_first_run_key(), "").strip() == ""
+
+
+def _mark_first_run_done() -> None:
+    save_cursor(_first_run_key(), str(int(time.time())))
+
+
+def ack_all_unacked_inbound_once(reason: str = "bootstrap") -> Dict[str, int]:
+    """
+    Only used on the very first bridge run to prevent retry loops from replaying historical DB rows.
+    This intentionally does NOT run on normal restarts.
+    """
+    now = int(time.time())
+    stats = {"inbound": 0, "reactions": 0}
+    with state_db_conn() as con:
+        try:
+            r = con.execute("SELECT COUNT(1) AS n FROM inbound_delivery WHERE acked=0").fetchone()
+            n = int(r["n"] or 0) if r else 0
+            if n:
+                con.execute(
+                    "UPDATE inbound_delivery SET acked=1, delivered_ts=?, last_error=NULL WHERE acked=0",
+                    (now,),
+                )
+                stats["inbound"] = n
+        except Exception:
+            pass
+
+        try:
+            r = con.execute("SELECT COUNT(1) AS n FROM inbound_reaction_delivery WHERE acked=0").fetchone()
+            n = int(r["n"] or 0) if r else 0
+            if n:
+                con.execute(
+                    "UPDATE inbound_reaction_delivery SET acked=1, delivered_ts=?, last_error=NULL WHERE acked=0",
+                    (now,),
+                )
+                stats["reactions"] = n
+        except Exception:
+            pass
+
+        con.commit()
+
+    if stats["inbound"] or stats["reactions"]:
+        log("INFO", "bootstrap acked preexisting deliveries", reason=reason, inbound=stats["inbound"], reactions=stats["reactions"])
+    return stats
+
 
 # ---- New: matrix event mapping helpers ----
 
@@ -797,6 +861,32 @@ def is_recent_outbound_echo(conv_id: str, text: str) -> bool:
             (conv, tsh, cutoff),
         ).fetchone()
         return bool(r)
+
+
+def is_recent_outbound_echo_global_unambiguous(text: str) -> bool:
+    """
+    Conservative global fallback:
+    - If exactly ONE recent_outbound row matches this text hash within the window, treat as echo.
+    - If multiple matches exist, do not suppress (avoid false positives).
+    """
+    txt = (text or "").strip()
+    if not txt:
+        return False
+    tsh = sha1_hex(txt)
+    now = int(time.time())
+    cutoff = now - int(RECENT_OUTBOUND_WINDOW_SEC)
+    with state_db_conn() as con:
+        r = con.execute(
+            """
+            SELECT COUNT(1) AS n
+            FROM recent_outbound
+            WHERE text_sha1=?
+              AND created_ts >= ?
+            """,
+            (tsh, cutoff),
+        ).fetchone()
+        n = int(r["n"] or 0) if r else 0
+        return n == 1
 
 
 # ---- Outbound queue (existing) ----
@@ -1269,34 +1359,70 @@ def compute_delivery_id(row: sqlite3.Row) -> str:
 
 
 def fetch_new_messages(con: sqlite3.Connection, after_sort_time: int, after_id: int) -> List[sqlite3.Row]:
-    q = """
+    """
+    Prefer excluding reaction-backed rows from normal message forwarding to avoid duplicates.
+    If reaction_record is unavailable for some reason, fall back to the old query.
+    """
+    q_join = """
         SELECT
-          id,
-          message_thread_id,
-          internet_message_id,
-          internet_conversation_id,
-          origin,
-          status,
-          web_transfer_state,
-          "from" as from_addr,
-          text,
-          sort_time,
-          sent_time,
-          ota_uuid,
-          media_attachment_id,
-          latitude,
-          longitude,
-          altitude
-        FROM message
-        WHERE internet_conversation_id IS NOT NULL
+          m.id,
+          m.message_thread_id,
+          m.internet_message_id,
+          m.internet_conversation_id,
+          m.origin,
+          m.status,
+          m.web_transfer_state,
+          m."from" as from_addr,
+          m.text,
+          m.sort_time,
+          m.sent_time,
+          m.ota_uuid,
+          m.media_attachment_id,
+          m.latitude,
+          m.longitude,
+          m.altitude
+        FROM message m
+        LEFT JOIN reaction_record rr ON rr.reaction_message_id = m.id
+        WHERE m.internet_conversation_id IS NOT NULL
+          AND rr.reaction_message_id IS NULL
           AND (
-                sort_time > ?
-             OR (sort_time = ? AND id > ?)
+                m.sort_time > ?
+             OR (m.sort_time = ? AND m.id > ?)
           )
-        ORDER BY sort_time ASC, id ASC
+        ORDER BY m.sort_time ASC, m.id ASC
         LIMIT ?
     """
-    return con.execute(q, (after_sort_time, after_sort_time, after_id, TAIL_LIMIT)).fetchall()
+    try:
+        return con.execute(q_join, (after_sort_time, after_sort_time, after_id, TAIL_LIMIT)).fetchall()
+    except Exception:
+        q = """
+            SELECT
+              id,
+              message_thread_id,
+              internet_message_id,
+              internet_conversation_id,
+              origin,
+              status,
+              web_transfer_state,
+              "from" as from_addr,
+              text,
+              sort_time,
+              sent_time,
+              ota_uuid,
+              media_attachment_id,
+              latitude,
+              longitude,
+              altitude
+            FROM message
+            WHERE internet_conversation_id IS NOT NULL
+              AND (
+                    sort_time > ?
+                 OR (sort_time = ? AND id > ?)
+              )
+            ORDER BY sort_time ASC, id ASC
+            LIMIT ?
+        """
+        return con.execute(q, (after_sort_time, after_sort_time, after_id, TAIL_LIMIT)).fetchall()
 
 
 def fetch_message_by_id(con: sqlite3.Connection, message_id: int) -> Optional[sqlite3.Row]:
@@ -1422,17 +1548,27 @@ def _is_matrix_echo_origin0(conv: str, ota_uuid: Optional[str], text: Optional[s
     Echo suppression policy for origin=0 messages:
       1) Strong: if mapping exists for ota_uuid with source='matrix' => echo
       2) Weak fallback: if recent_outbound matches (conv + text hash) within a short window => echo
+      3) Conservative global fallback: if exactly one recent_outbound matches text hash in window => echo
     """
     if ota_uuid:
         m = lookup_matrix_event_for_ota(str(conv), str(ota_uuid))
         if m and str(m["source"] or "").lower() == "matrix":
             return True
-    # fallback (best-effort)
+
+    # fallback (best-effort, conv-scoped)
     try:
         if conv and text and is_recent_outbound_echo(str(conv), str(text)):
             return True
     except Exception:
         pass
+
+    # fallback (best-effort, global but conservative)
+    try:
+        if text and is_recent_outbound_echo_global_unambiguous(str(text)):
+            return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -1626,12 +1762,19 @@ def _process_reaction_retry_batch() -> None:
 def poll_loop(stop_evt: threading.Event) -> None:
     init_state()
 
-    # Cursor: (after_sort_time, after_id)
+    # Cursor: (after_sort_time, after_id) for messages
     cur = load_cursor("poll_cursor", "0:0")
     try:
         after_sort_time, after_id = [int(x) for x in cur.split(":", 1)]
     except Exception:
         after_sort_time, after_id = 0, 0
+
+    # Separate cursor for reactions (prevents missing reactions when messages advance)
+    rcur = load_cursor("reaction_cursor", "0:0")
+    try:
+        react_after_sort_time, react_after_id = [int(x) for x in rcur.split(":", 1)]
+    except Exception:
+        react_after_sort_time, react_after_id = 0, 0
 
     pending: Dict[str, PendingMedia] = {}
 
@@ -1642,27 +1785,43 @@ def poll_loop(stop_evt: threading.Event) -> None:
         batch_limit=TAIL_LIMIT,
         backfill=BACKFILL,
         cursor=f"{after_sort_time}:{after_id}",
+        reaction_cursor=f"{react_after_sort_time}:{react_after_id}",
     )
 
     # First-run bootstrap:
     # - BACKFILL=0  => start at latest (emit nothing historical)
     # - BACKFILL=N  => emit exactly N newest messages (global) on first start
-    if after_sort_time == 0 and after_id == 0:
+    # Additionally, ONLY on first run and BACKFILL=0: ack any preexisting delivery rows so retry-loop does not replay history.
+    if _is_first_run():
+        try:
+            if int(BACKFILL) == 0:
+                ack_all_unacked_inbound_once(reason="first_run_backfill0")
+        except Exception:
+            pass
+
         try:
             with garmin_db_conn() as con0:
                 bst, bid = _bootstrap_cursor(con0, BACKFILL)
+                # reactions: safest is to start at latest too (no historical reaction flood on first run)
+                rbst, rbid = snapshot_global_cursor(con0)
             after_sort_time, after_id = int(bst), int(bid)
+            react_after_sort_time, react_after_id = int(rbst), int(rbid)
             save_cursor("poll_cursor", f"{after_sort_time}:{after_id}")
+            save_cursor("reaction_cursor", f"{react_after_sort_time}:{react_after_id}")
+            _mark_first_run_done()
             log(
                 "INFO",
-                "cursor bootstrapped",
+                "cursor bootstrapped (first run)",
                 backfill=BACKFILL,
                 after_sort_time=after_sort_time,
                 after_id=after_id,
+                react_after_sort_time=react_after_sort_time,
+                react_after_id=react_after_id,
             )
         except Exception as e:
-            # Conservative fallback: replay from 0:0 (may cause historical emit)
-            log("WARN", "cursor bootstrap failed; will replay from 0:0", err=str(e))
+            # Conservative fallback: keep existing cursors
+            _mark_first_run_done()
+            log("WARN", "cursor bootstrap failed on first run; keeping existing cursors", err=str(e))
 
     while not stop_evt.is_set():
         try:
@@ -1671,7 +1830,7 @@ def poll_loop(stop_evt: threading.Event) -> None:
                 _process_inbound_retry_batch(con)
                 _process_reaction_retry_batch()
 
-                # 1) normal messages
+                # 1) normal messages (message cursor)
                 rows = fetch_new_messages(con, after_sort_time, after_id)
                 for r in rows:
                     # advance cursor immediately (at-least-once semantics)
@@ -1728,16 +1887,13 @@ def poll_loop(stop_evt: threading.Event) -> None:
                     else:
                         schedule_inbound_retry(delivery_id, "maubot delivery failed (initial)")
 
-                # 2) reactions (separate query; same cursor semantics)
-                rrows = fetch_new_reactions(con, after_sort_time, after_id)
+                # 2) reactions (reaction cursor)
+                rrows = fetch_new_reactions(con, react_after_sort_time, react_after_id)
                 for rr in rrows:
-                    # advance cursor to reaction rm.sort_time/id
-                    rst = int(rr["reaction_sort_time"] or 0)
-                    rid = int(rr["reaction_msg_row_id"] or 0)
-                    if (rst > after_sort_time) or (rst == after_sort_time and rid > after_id):
-                        after_sort_time = rst
-                        after_id = rid
-                        save_cursor("poll_cursor", f"{after_sort_time}:{after_id}")
+                    # advance reaction cursor
+                    react_after_sort_time = int(rr["reaction_sort_time"] or 0)
+                    react_after_id = int(rr["reaction_msg_row_id"] or 0)
+                    save_cursor("reaction_cursor", f"{react_after_sort_time}:{react_after_id}")
 
                     conv_id = rr["conv_id"]
                     reaction_ota = rr["reaction_ota_uuid"]
@@ -1902,6 +2058,11 @@ def outbound_worker(stop_evt: threading.Event) -> None:
                             )
                         except Exception:
                             pass
+                        # NEW: update recent_outbound with the now-known conv_id (helps echo fallback)
+                        try:
+                            record_recent_outbound(room, ev, str(conv_from_row or conv), text)
+                        except Exception:
+                            pass
                         log("INFO", "outbound correlated", job_id=job_id, ota_uuid=str(ota_uuid))
                     else:
                         log("WARN", "outbound correlation failed", job_id=job_id)
@@ -1952,6 +2113,11 @@ def outbound_worker(stop_evt: threading.Event) -> None:
                                 kind="message",
                                 source="matrix",
                             )
+                        except Exception:
+                            pass
+                        # NEW: update recent_outbound with conv_id now that it is known
+                        try:
+                            record_recent_outbound(room, ev, str(conv_from_row), text)
                         except Exception:
                             pass
                         log("INFO", "new_thread correlated", job_id=job_id, ota_uuid=str(ota_uuid), conv=str(conv_from_row))
@@ -2034,7 +2200,7 @@ def _ack_any_delivery(delivery_id: str) -> bool:
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "garmin-bridge/2.5"
+    server_version = "garmin-bridge/2.6"
 
     def do_GET(self):  # noqa: N802
         path, qs = _parse_query(self.path)
@@ -2121,7 +2287,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return _send(self, 400, {"ok": False, "error": "internet_conversation_id, garmin_ota_uuid, matrix_room_id, matrix_event_id required"})
 
             try:
-                upsert_matrix_event_map(conv, ota, room, ev, kind=kind, source=str(source), emoji=(str(emoji) if emoji is not None else None), target_ota_uuid=(str(target_ota) if target_ota is not None else None))
+                upsert_matrix_event_map(
+                    conv,
+                    ota,
+                    room,
+                    ev,
+                    kind=kind,
+                    source=str(source),
+                    emoji=(str(emoji) if emoji is not None else None),
+                    target_ota_uuid=(str(target_ota) if target_ota is not None else None),
+                )
             except Exception as e:
                 return _send(self, 500, {"ok": False, "error": f"db error: {str(e)[:200]}"})
 

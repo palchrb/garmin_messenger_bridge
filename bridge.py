@@ -471,6 +471,33 @@ def post_json(url: str, payload: Dict[str, Any], bearer: str = "", timeout: int 
         b = resp.read(8192)
         return int(resp.status), b.decode("utf-8", errors="replace")
 
+def post_json_idem(
+    url: str,
+    payload: Dict[str, Any],
+    bearer: str,
+    timeout: int = 30,
+    idem_key: Optional[str] = None,
+    sign_hmac: bool = True,
+) -> Tuple[int, str]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+
+    # STRICT: always use the shared bearer token (required)
+    if not bearer:
+        raise ValueError("Bearer token is required for Maubot requests")
+    req.add_header("Authorization", f"Bearer {bearer}")
+
+    if idem_key:
+        req.add_header("Idempotency-Key", str(idem_key))
+
+    if sign_hmac and HMAC_SECRET:
+        req.add_header(HMAC_HEADER, _hmac_hexdigest(HMAC_SECRET, body))
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        b = resp.read(8192)
+        return int(resp.status), b.decode("utf-8", errors="replace")
+
 
 def load_cursor(name: str, default: str = "") -> str:
     with state_db_conn() as con:
@@ -1505,6 +1532,81 @@ def fetch_backfill_messages(con: sqlite3.Connection, since_epoch: int, limit: in
     """
     return con.execute(q, (int(limit),)).fetchall()
 
+def _try_fetch_participants(con: sqlite3.Connection, thread_id: int) -> List[str]:
+    """Best-effort participant discovery across schema variants."""
+    participants: List[str] = []
+    if not thread_id:
+        return participants
+
+    # Try a few known/likely schema patterns. Fail silently if table/column doesn't exist.
+    probes = [
+        ("SELECT DISTINCT phone_number AS p FROM message_thread_member WHERE message_thread_id=? AND phone_number IS NOT NULL", (thread_id,)),
+        ("SELECT DISTINCT msisdn AS p FROM conversation_member WHERE message_thread_id=? AND msisdn IS NOT NULL", (thread_id,)),
+        ("SELECT DISTINCT cm.msisdn AS p FROM conversation_member cm WHERE cm.conversation_id=? AND cm.msisdn IS NOT NULL", (thread_id,)),
+        ("SELECT DISTINCT c.phone_number AS p FROM conversation_member cm JOIN contact c ON c.id = cm.contact_id WHERE cm.message_thread_id=? AND c.phone_number IS NOT NULL", (thread_id,)),
+    ]
+    for sql, args in probes:
+        try:
+            rows = con.execute(sql, args).fetchall()
+            for r in rows:
+                p = str(r["p"] or "").strip()
+                if p and p not in participants:
+                    participants.append(p)
+            if participants:
+                return participants
+        except Exception:
+            continue
+    return participants
+
+
+def list_conversations_for_sync(limit: int = 500) -> List[Dict[str, Any]]:
+    """
+    Return a list of conversations (best-effort) for Maubot to create/link rooms.
+    """
+    out: List[Dict[str, Any]] = []
+    with garmin_db_conn() as con:
+        rows = con.execute(
+            """
+            SELECT
+              internet_conversation_id AS conv_id,
+              MAX(sort_time) AS last_sort_time
+            FROM message
+            WHERE internet_conversation_id IS NOT NULL
+            GROUP BY internet_conversation_id
+            ORDER BY last_sort_time DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+
+        for r in rows:
+            conv_id = str(r["conv_id"] or "").strip()
+            if not conv_id:
+                continue
+            thread_id = resolve_thread_id_for_conversation(con, conv_id) or 0
+            participants = _try_fetch_participants(con, int(thread_id)) if thread_id else []
+
+            # Fallback: use state-db cached participants_json if present
+            if not participants:
+                try:
+                    link = get_link_by_conversation(conv_id)
+                    if link and link["participants_json"]:
+                        pj = json.loads(str(link["participants_json"]))
+                        if isinstance(pj, list):
+                            participants = [str(x) for x in pj if str(x).strip()]
+                except Exception:
+                    pass
+
+            out.append(
+                {
+                    "internet_conversation_id": conv_id,
+                    "message_thread_id": int(thread_id) if thread_id else None,
+                    "participants": participants,
+                    "last_sort_time": int(r["last_sort_time"] or 0),
+                }
+            )
+    return out
+
 
 # ---- New: Reactions polling ----
 
@@ -1571,74 +1673,179 @@ def _is_matrix_echo_origin0(conv: str, ota_uuid: Optional[str], text: Optional[s
 
     return False
 
+def _read_file_b64(path: str, max_mb: float = 0) -> Optional[str]:
+    """Read file and return base64-encoded string (UTF-8)."""
+    if not path:
+        return None
+    try:
+        if max_mb and size_mb(path) > float(max_mb):
+            return None
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except Exception as e:
+        log("WARN", "failed reading media file", path=path, err=str(e))
+        return None
+
+
+def build_media_payload(attach_id: str, best_path: Optional[str], candidates: List[str]) -> Dict[str, Any]:
+    """
+    Build a Maubot-friendly media payload.
+
+    We prefer pushing bytes inline (data_b64) because Maubot typically does not have
+    filesystem access to the ReDroid container.
+    """
+    mime_probe_path = best_path or (candidates[0] if candidates else None)
+    payload: Dict[str, Any] = {
+        "attachment_id": str(attach_id),
+        "mime": _guess_mime(mime_probe_path),
+        "filename": os.path.basename(best_path or mime_probe_path or str(attach_id)),
+        "best_path": best_path,              # kept only for debugging
+        "candidate_paths": candidates[:10],  # kept only for debugging
+    }
+
+    if best_path:
+        payload["data_b64"] = _read_file_b64(best_path, max_mb=float(MAX_ATTACH_MB or 0))
+    return payload
 
 def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str) -> bool:
-    # IMPORTANT: no conversation_link gate; always forward
     if not MAUBOT_WEBHOOK_URL:
         log("WARN", "MAUBOT_WEBHOOK_URL not set; cannot forward", delivery_id=delivery_id)
         note_delivery_error(delivery_id, "MAUBOT_WEBHOOK_URL not set")
         return False
 
+    if not MAUBOT_WEBHOOK_TOKEN:
+        log("WARN", "MAUBOT_WEBHOOK_TOKEN not set; cannot forward", delivery_id=delivery_id)
+        note_delivery_error(delivery_id, "MAUBOT_WEBHOOK_TOKEN not set")
+        return False
+
+    maubot_base = MAUBOT_WEBHOOK_URL.rstrip("/")
+    maubot_media_url = maubot_base + "/media"
+
     origin = int(r["origin"] or 0)
     ota_uuid = r["ota_uuid"]
-    conv = r["internet_conversation_id"]
+    conv = str(r["internet_conversation_id"] or "").strip()
     imid = r["internet_message_id"]
 
     attach_id = r["media_attachment_id"]
-    media = None
-    if attach_id:
-        best_path, candidates = resolve_media(ROOT_DIR, str(attach_id))
+    media_ref: Optional[Dict[str, Any]] = None
 
-        # Size guard applies only to best_path; candidates are still useful as fallbacks in Maubot.
+    # --- If media exists, upload to Maubot first (old mediarelay-style) ---
+    if attach_id:
+        best_path, _candidates = resolve_media(ROOT_DIR, str(attach_id))
+
         if best_path:
             mb = size_mb(best_path)
             if MAX_ATTACH_MB and mb > float(MAX_ATTACH_MB):
-                log("WARN", "media too large; not attaching best_path", delivery_id=delivery_id, mb=f"{mb:.2f}", limit=MAX_ATTACH_MB)
-                best_path = None
+                log("WARN", "media too large; skipping upload", delivery_id=delivery_id, mb=f"{mb:.2f}", limit=MAX_ATTACH_MB)
+            else:
+                b64 = _read_file_b64(best_path, max_mb=float(MAX_ATTACH_MB or 0))
+                if not b64:
+                    log("WARN", "failed to read media for upload", delivery_id=delivery_id, path=best_path)
+                else:
+                    filename = os.path.basename(best_path)
+                    mimetype = _guess_mime(best_path)
 
-        mime_probe_path = best_path or (candidates[0] if candidates else None)
-        media = {
-            "attachment_id": str(attach_id),
-            "best_path": best_path,
-            "candidate_paths": candidates,
-            "mime": _guess_mime(mime_probe_path),
-            "mime_source": "filename",
-        }
+                    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+                    as_voice = mimetype.startswith("audio/") and ext in ("ogg", "oga", "m4a", "wav")
 
+                    # Stable idempotency key (retries safe)
+                    idem_key = f"msg:{str(ota_uuid or delivery_id)}:att:{str(attach_id)}"
+
+                    upload_payload: Dict[str, Any] = {
+                        # Classic mediarelay fields
+                        "filename": filename,
+                        "mimetype": mimetype,
+                        "data_b64": b64,
+                        "caption": (r["text"] or "") if r["text"] is not None else "",
+                        "as_voice": bool(as_voice),
+
+                        # Routing/context for garminbot
+                        "event_type": "bridge_media",
+                        "delivery_id": str(delivery_id),
+                        "internet_conversation_id": conv,
+                        "ota_uuid": str(ota_uuid) if ota_uuid else None,
+                        "internet_message_id": str(imid) if imid else None,
+                        "origin": int(origin),
+                        "from": str(r["from_addr"] or ""),
+                    }
+
+                    try:
+                        code, resp = post_json_idem(
+                            maubot_media_url,
+                            upload_payload,
+                            bearer=MAUBOT_WEBHOOK_TOKEN,
+                            timeout=60,
+                            idem_key=idem_key,
+                            sign_hmac=True,
+                        )
+                        if 200 <= code < 300:
+                            try:
+                                media_ref = json.loads(resp) if resp else {"ok": True}
+                            except Exception:
+                                media_ref = {"ok": True, "raw": resp[:800]}
+                            media_ref.update({
+                                "uploaded": True,
+                                "attachment_id": str(attach_id),
+                                "filename": filename,
+                                "mimetype": mimetype,
+                            })
+                            log("INFO", "media uploaded to maubot", delivery_id=delivery_id, code=code, filename=filename)
+                        else:
+                            log("WARN", "maubot media upload rejected", delivery_id=delivery_id, code=code, resp=resp[:600])
+                            # Continue to send inbound event (text still useful)
+                    except Exception as e:
+                        log("WARN", "maubot media upload failed", delivery_id=delivery_id, err=str(e))
+                        # Continue to send inbound event
+        else:
+            # Your pending-media loop will retry when file appears
+            log("DEBUG", "media not yet on disk (pending/retry will handle)", delivery_id=delivery_id, attachment_id=str(attach_id))
+
+    # --- Now forward the main inbound event (no bytes embedded) ---
     payload = {
         "event_type": "bridge_inbound",
-        "delivery_id": delivery_id,
+        "delivery_id": str(delivery_id),
+        "internet_conversation_id": conv,
         "ota_uuid": str(ota_uuid) if ota_uuid else None,
         "internet_message_id": str(imid) if imid else None,
-        "internet_conversation_id": str(conv),
-        # NOTE: matrix_room_id intentionally omitted (Maubot maps conv→room)
-        "message": {
-            "id": int(r["id"]),
-            "origin": origin,
-            "from": r["from_addr"],
-            "text": r["text"],
-            "sent_time": epoch_s(r["sent_time"]),
-            "sort_time": epoch_s(r["sort_time"]),
+        "origin": int(origin),
+        "from": str(r["from_addr"] or ""),
+        "text": r["text"],
+        "sort_time": int(r["sort_time"] or 0),
+        "sent_time": int(r["sent_time"] or 0),
+        "location": {
             "latitude": r["latitude"],
             "longitude": r["longitude"],
             "altitude": r["altitude"],
         },
-        "media": media,
-        "source": "garmin_remote" if origin == 1 else "garmin_local",
+        "media_attachment_id": str(attach_id) if attach_id else None,
+        "media_ref": media_ref,
     }
 
     try:
-        code, resp = post_json(MAUBOT_WEBHOOK_URL, payload, bearer=MAUBOT_WEBHOOK_TOKEN, timeout=20, sign_hmac=True)
+        code, resp = post_json(
+            MAUBOT_WEBHOOK_URL,
+            payload,
+            bearer=MAUBOT_WEBHOOK_TOKEN,
+            timeout=30,
+            sign_hmac=True,
+        )
         if 200 <= code < 300:
-            log("INFO", "forwarded inbound", delivery_id=delivery_id, conv=str(conv), code=code, origin=origin)
+            log("INFO", "forwarded inbound", delivery_id=delivery_id, conv=conv, code=code, origin=origin)
             return True
+
         log("WARN", "maubot rejected", delivery_id=delivery_id, code=code, resp=resp[:600])
         note_delivery_error(delivery_id, f"maubot {code}: {resp[:300]}")
         return False
+
     except Exception as e:
         log("WARN", "maubot forward failed", delivery_id=delivery_id, err=str(e))
         note_delivery_error(delivery_id, f"exception: {str(e)[:300]}")
         return False
+
+
 
 
 def forward_reaction_to_maubot(conv_id: str, reaction_ota_uuid: str, target_ota_uuid: str, emoji: str, operation: int, reaction_sort_time: Optional[int]) -> bool:
@@ -2220,7 +2427,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if not r:
                 return _send(self, 404, {"ok": False, "error": "not found"})
             return _send(self, 200, {"ok": True, "matrix_room_id": r["matrix_room_id"], "matrix_event_id": r["matrix_event_id"], "kind": r["kind"], "source": r["source"]})
-
+      
+        # Sync: list all known conversations so Maubot can create/link rooms.
+        if path == "/sync/conversations":
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+            lim = (qs.get("limit") or ["500"])[0]
+            try:
+                limit = max(1, min(2000, int(lim)))
+            except Exception:
+                limit = 500
+            convs = list_conversations_for_sync(limit=limit)
+            return _send(self, 200, {"ok": True, "count": len(convs), "conversations": convs})
+        
         # Lookup latest reaction event for (target_ota_uuid, emoji) in a conversation
         if path == "/matrix/lookup_reaction":
             if not _auth_ok(dict(self.headers)):
@@ -2269,16 +2488,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             source = (body.get("source") or body.get("from_matrix") or "").strip()
 
             # normalize source
-            if isinstance(source, str):
-                s = source.lower()
-                if s in ("1", "true", "yes", "on", "matrix"):
-                    source = "matrix"
-                elif s in ("0", "false", "no", "off", "garmin"):
-                    source = "garmin"
-                elif not s:
-                    source = "garmin"
-            else:
-                source = "garmin"
+            # All calls to this endpoint originate from Matrix (Maubot)
+            source = "matrix"
 
             emoji = body.get("emoji")
             target_ota = body.get("target_ota_uuid")

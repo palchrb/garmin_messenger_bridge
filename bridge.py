@@ -2554,8 +2554,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception:
                 limit = 500
             convs = list_conversations_for_sync(limit=limit)
+            resp = {"ok": True, "count": len(convs), "conversations": convs}
             _debug_log_http_response("/sync/conversations", resp)
-            return _send(self, 200, {"ok": True, "count": len(convs), "conversations": convs})
+            return _send(self, 200, resp)
         
         # Lookup latest reaction event for (target_ota_uuid, emoji) in a conversation
         if path == "/matrix/lookup_reaction":

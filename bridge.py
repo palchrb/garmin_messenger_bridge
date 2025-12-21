@@ -649,6 +649,8 @@ def ack_all_unacked_inbound_once(reason: str = "bootstrap") -> Dict[str, int]:
         log("INFO", "bootstrap acked preexisting deliveries", reason=reason, inbound=stats["inbound"], reactions=stats["reactions"])
     return stats
 
+#---debug logging functions
+
 def _redact_payload(obj: Any) -> Any:
     """
     Redact/trim sensitive or huge fields before logging.
@@ -698,6 +700,16 @@ def _debug_log_json_payload(tag: str, payload: Dict[str, Any]) -> None:
         log("DEBUG", tag, json=json.dumps(safe, ensure_ascii=False))
     except Exception as e:
         log("DEBUG", tag, err=f"payload log failed: {e}")
+
+
+def _debug_log_http_response(path: str, payload: Dict[str, Any]) -> None:
+    if _CUR_LEVEL > _LEVELS["DEBUG"]:
+        return
+    try:
+        safe = _redact_payload(payload)
+        log("DEBUG", "http response", path=str(path), json=json.dumps(safe, ensure_ascii=False))
+    except Exception as e:
+        log("DEBUG", "http response", path=str(path), err=f"payload log failed: {e}")
 
 
 # ---- New: matrix event mapping helpers ----
@@ -2542,6 +2554,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception:
                 limit = 500
             convs = list_conversations_for_sync(limit=limit)
+            _debug_log_http_response("/sync/conversations", resp)
             return _send(self, 200, {"ok": True, "count": len(convs), "conversations": convs})
         
         # Lookup latest reaction event for (target_ota_uuid, emoji) in a conversation

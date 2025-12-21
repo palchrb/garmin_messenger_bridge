@@ -556,6 +556,60 @@ def upsert_link(internet_conversation_id: str, matrix_room_id: str, account_id: 
         con.commit()
 
 
+def _split_csv(s: Optional[str]) -> List[str]:
+    out: List[str] = []
+    if not s:
+        return out
+    for part in str(s).split(","):
+        p = part.strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def _participants_for_conv(con: sqlite3.Connection, conv_id: str) -> List[str]:
+    """
+    conv_id == message.internet_conversation_id (UUID string) == conversation.conversation_id
+    Preferred: conversation.member_addressess (already addresses, CSV)
+    Fallback: conversation.memberIds (member_id CSV) -> conversation_member(member_id->address)
+    """
+    if not conv_id:
+        return []
+
+    row = con.execute(
+        "SELECT member_addressess, memberIds FROM conversation WHERE conversation_id=? LIMIT 1",
+        (str(conv_id),),
+    ).fetchone()
+    if not row:
+        return []
+
+    # 1) Preferred: direct addresses list
+    direct = _split_csv(row["member_addressess"] if "member_addressess" in row.keys() else None)
+    if direct:
+        return direct
+
+    # 2) Fallback: memberIds -> lookup in conversation_member
+    mids = _split_csv(row["memberIds"] if "memberIds" in row.keys() else None)
+    if not mids:
+        return []
+
+    qs = ",".join("?" for _ in mids)
+    rows = con.execute(
+        f"SELECT DISTINCT address FROM conversation_member WHERE member_id IN ({qs}) AND address IS NOT NULL",
+        tuple(mids),
+    ).fetchall()
+
+    out: List[str] = []
+    for r in rows:
+        a = str(r["address"] or "").strip()
+        if a and a not in out:
+            out.append(a)
+    return out
+        
+
+
+
+
 def get_link_by_conversation(internet_conversation_id: str) -> Optional[sqlite3.Row]:
     with state_db_conn() as con:
         return con.execute("SELECT * FROM conversation_link WHERE internet_conversation_id=? LIMIT 1", (internet_conversation_id,)).fetchone()
@@ -1691,7 +1745,11 @@ def list_conversations_for_sync(limit: int = 500) -> List[Dict[str, Any]]:
             if not conv_id:
                 continue
             thread_id = resolve_thread_id_for_conversation(con, conv_id) or 0
-            participants = _try_fetch_participants(con, int(thread_id)) if thread_id else []
+            participants: List[str] = []
+            try:
+                participants = _participants_for_conv(con, conv_id)
+            except Exception:
+                participants = []
 
             # Fallback: use state-db cached participants_json if present
             if not participants:

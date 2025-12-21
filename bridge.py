@@ -649,6 +649,56 @@ def ack_all_unacked_inbound_once(reason: str = "bootstrap") -> Dict[str, int]:
         log("INFO", "bootstrap acked preexisting deliveries", reason=reason, inbound=stats["inbound"], reactions=stats["reactions"])
     return stats
 
+def _redact_payload(obj: Any) -> Any:
+    """
+    Redact/trim sensitive or huge fields before logging.
+    Keeps structure for debugging without leaking secrets.
+    """
+    # Keys we want to redact fully (or partially)
+    redact_keys = {
+        "Authorization", "authorization",
+        "MAUBOT_WEBHOOK_TOKEN", "token", "access_token",
+        "hmac", "HMAC", "signature",
+    }
+    huge_keys = {"data_b64", "file_b64", "bytes_b64"}
+
+    def walk(x: Any) -> Any:
+        if isinstance(x, dict):
+            out = {}
+            for k, v in x.items():
+                ks = str(k)
+                if ks in redact_keys:
+                    out[ks] = "<redacted>"
+                elif ks in huge_keys:
+                    if isinstance(v, str):
+                        out[ks] = f"<omitted b64 len={len(v)}>"
+                    else:
+                        out[ks] = "<omitted b64>"
+                else:
+                    out[ks] = walk(v)
+            return out
+        if isinstance(x, list):
+            return [walk(i) for i in x[:200]]  # bound list size in logs
+        if isinstance(x, str):
+            return x if len(x) <= 4000 else (x[:4000] + "…<truncated>")
+        return x
+
+    return walk(obj)
+
+
+def _debug_log_json_payload(tag: str, payload: Dict[str, Any]) -> None:
+    """
+    Log full JSON payload when LOG_LEVEL is DEBUG.
+    Uses redaction + truncation to avoid leaking secrets / huge blobs.
+    """
+    if _CUR_LEVEL > _LEVELS["DEBUG"]:
+        return
+    try:
+        safe = _redact_payload(payload)
+        log("DEBUG", tag, json=json.dumps(safe, ensure_ascii=False))
+    except Exception as e:
+        log("DEBUG", tag, err=f"payload log failed: {e}")
+
 
 # ---- New: matrix event mapping helpers ----
 
@@ -1881,6 +1931,9 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
         "media_ref": None,
     }
 
+    _debug_log_json_payload("maubot POST / (bridge_inbound)", payload)
+
+    
     try:
         code, resp = post_json(
             MAUBOT_WEBHOOK_URL,

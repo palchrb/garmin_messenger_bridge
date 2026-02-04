@@ -39,6 +39,7 @@ import hmac
 import json
 import mimetypes
 import os
+import queue
 import random
 import re
 import signal
@@ -46,6 +47,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
@@ -93,6 +95,12 @@ BACKFILL = env("BACKFILL", 0, int)  # 0=no backfill on first run, N=backfill N n
 # ---- HMAC (optional) ----
 HMAC_SECRET = env("HMAC_SECRET", "")
 HMAC_HEADER = env("HMAC_HEADER", "X-Bridge-HMAC")
+
+# ---- Bridge Mode ----
+# "maubot" = push events to Maubot webhook (original behavior)
+# "gobridge" = expose SSE stream for mautrix-go bridge to pull events
+BRIDGE_MODE = env("BRIDGE_MODE", "maubot")  # maubot | gobridge
+GARMIN_USER_ID = env("GARMIN_USER_ID", "")  # Your Garmin user identifier (phone/email)
 
 # ---- HTTP API ----
 HTTP_BIND = env("HTTP_BIND", "127.0.0.1")
@@ -207,6 +215,187 @@ def _backoff(base_sec: float, max_sec: float, attempt: int) -> float:
     sec = base_sec * (2 ** (a - 1))
     sec = min(float(max_sec), float(sec))
     return float(sec) + _jitter()
+
+
+# ---- SSE Event Queue (for gobridge mode) ----
+# Thread-safe queue for pushing events to connected SSE clients
+# Each client gets its own queue; we broadcast to all
+
+class SSEBroadcaster:
+    """
+    Manages multiple SSE client queues and broadcasts events to all.
+    Used in gobridge mode to push events to mautrix-go bridge.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients: Dict[str, queue.Queue] = {}
+
+    def subscribe(self) -> Tuple[str, queue.Queue]:
+        """Register a new SSE client, returns (client_id, queue)."""
+        client_id = str(uuid.uuid4())
+        q: queue.Queue = queue.Queue(maxsize=1000)
+        with self._lock:
+            self._clients[client_id] = q
+        log("INFO", "sse client subscribed", client_id=client_id, total_clients=len(self._clients))
+        return client_id, q
+
+    def unsubscribe(self, client_id: str) -> None:
+        """Unregister an SSE client."""
+        with self._lock:
+            self._clients.pop(client_id, None)
+        log("INFO", "sse client unsubscribed", client_id=client_id, total_clients=len(self._clients))
+
+    def broadcast(self, event: Dict[str, Any]) -> int:
+        """Broadcast an event to all connected clients. Returns number of clients notified."""
+        with self._lock:
+            clients = list(self._clients.items())
+
+        notified = 0
+        for cid, q in clients:
+            try:
+                q.put_nowait(event)
+                notified += 1
+            except queue.Full:
+                log("WARN", "sse client queue full, dropping event", client_id=cid)
+        return notified
+
+    def client_count(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+
+# Global SSE broadcaster instance
+_sse_broadcaster = SSEBroadcaster()
+
+
+def push_sse_event(event: Dict[str, Any]) -> int:
+    """Push an event to all connected SSE clients (gobridge mode)."""
+    if BRIDGE_MODE != "gobridge":
+        return 0
+    return _sse_broadcaster.broadcast(event)
+
+
+def build_bridgev2_message_event(row: sqlite3.Row, delivery_id: str) -> Dict[str, Any]:
+    """
+    Build a bridgev2-compatible message event for the Go bridge.
+
+    Format follows mautrix-go bridgev2 conventions:
+    - type: "message" | "reaction" | "read_receipt" | etc.
+    - portal_key: identifies the chat/room
+    - sender: who sent the message
+    - id: unique message identifier
+    - timestamp: when the message was sent
+    - content: the message content
+    """
+    conv_id = str(row["internet_conversation_id"] or "")
+    ota_uuid = str(row["ota_uuid"]) if row["ota_uuid"] else delivery_id
+    origin = int(row["origin"] or 0)
+    from_addr = str(row["from_addr"] or "")
+
+    # Determine sender - origin=0 means sent by us, origin=1 means received
+    is_from_me = (origin == 0)
+    sender_id = GARMIN_USER_ID if is_from_me else from_addr
+
+    event: Dict[str, Any] = {
+        "type": "message",
+        "portal_key": {
+            "id": conv_id,
+            "receiver": GARMIN_USER_ID,
+        },
+        "sender": {
+            "id": sender_id,
+            "is_from_me": is_from_me,
+        },
+        "id": ota_uuid,
+        "delivery_id": delivery_id,
+        "timestamp": int(row["sent_time"] or row["sort_time"] or 0),
+        "content": {
+            "msgtype": "m.text",
+            "body": row["text"] or "",
+        },
+    }
+
+    # Add location if present
+    if row["latitude"] is not None and row["longitude"] is not None:
+        event["content"] = {
+            "msgtype": "m.location",
+            "body": f"Location: {row['latitude']}, {row['longitude']}",
+            "geo_uri": f"geo:{row['latitude']},{row['longitude']}",
+        }
+        if row["altitude"] is not None:
+            event["content"]["altitude"] = row["altitude"]
+
+    # Add media reference if present (Go bridge will fetch via GET /media/{id})
+    attach_id = row["media_attachment_id"]
+    if attach_id:
+        best_path, _ = resolve_media(ROOT_DIR, str(attach_id))
+        if best_path:
+            event["media"] = {
+                "id": str(attach_id),
+                "mime_type": _guess_mime(best_path),
+                "filename": os.path.basename(best_path),
+                "size": os.path.getsize(best_path),
+                "ready": True,
+            }
+        else:
+            # Media not yet on disk - Go bridge can retry later
+            event["media"] = {
+                "id": str(attach_id),
+                "ready": False,
+            }
+
+    return event
+
+
+def build_bridgev2_reaction_event(
+    conv_id: str,
+    reaction_ota_uuid: str,
+    target_ota_uuid: str,
+    emoji: str,
+    operation: int,
+    timestamp: int,
+) -> Dict[str, Any]:
+    """
+    Build a bridgev2-compatible reaction event.
+    operation: 0 = add reaction, 1 = remove reaction
+    """
+    return {
+        "type": "reaction",
+        "portal_key": {
+            "id": conv_id,
+            "receiver": GARMIN_USER_ID,
+        },
+        "id": reaction_ota_uuid,
+        "target_id": target_ota_uuid,
+        "emoji": emoji,
+        "operation": "add" if operation == 0 else "remove",
+        "timestamp": timestamp,
+    }
+
+
+def build_bridgev2_media_ready_event(delivery_id: str, attachment_id: str, conv_id: str) -> Dict[str, Any]:
+    """
+    Build an event to notify the Go bridge that media is now ready for download.
+    """
+    best_path, _ = resolve_media(ROOT_DIR, str(attachment_id))
+    if not best_path:
+        return {}
+
+    return {
+        "type": "media_ready",
+        "delivery_id": delivery_id,
+        "portal_key": {
+            "id": conv_id,
+            "receiver": GARMIN_USER_ID,
+        },
+        "media": {
+            "id": str(attachment_id),
+            "mime_type": _guess_mime(best_path),
+            "filename": os.path.basename(best_path),
+            "size": os.path.getsize(best_path),
+            "ready": True,
+        },
+    }
 
 
 def garmin_db_conn() -> sqlite3.Connection:
@@ -1875,7 +2064,63 @@ def build_media_payload(attach_id: str, best_path: Optional[str], candidates: Li
         payload["data_b64"] = _read_file_b64(best_path, max_mb=float(MAX_ATTACH_MB or 0))
     return payload
 
+
+def _forward_to_gobridge(r: sqlite3.Row, delivery_id: str) -> bool:
+    """
+    Forward inbound message via SSE to connected Go bridge clients.
+
+    In gobridge mode:
+    - Events are pushed to SSE stream (no HTTP POST)
+    - Media is NOT embedded; Go bridge fetches via GET /media/{id}
+    - Format follows bridgev2 conventions
+    """
+    if _sse_broadcaster.client_count() == 0:
+        log("DEBUG", "no sse clients connected; event queued", delivery_id=delivery_id)
+        # Still return True - we don't want to retry just because no clients are connected
+        # The Go bridge may reconnect and should use backfill
+
+    event = build_bridgev2_message_event(r, delivery_id)
+
+    # Push to SSE clients
+    notified = push_sse_event(event)
+    log("INFO", "forwarded to gobridge via sse", delivery_id=delivery_id, clients_notified=notified)
+
+    return True
+
+
+def _forward_reaction_to_gobridge(
+    conv_id: str,
+    reaction_ota_uuid: str,
+    target_ota_uuid: str,
+    emoji: str,
+    operation: int,
+    reaction_sort_time: int,
+) -> bool:
+    """
+    Forward inbound reaction via SSE to connected Go bridge clients.
+    """
+    event = build_bridgev2_reaction_event(
+        conv_id, reaction_ota_uuid, target_ota_uuid, emoji, operation, reaction_sort_time
+    )
+
+    notified = push_sse_event(event)
+    log("INFO", "forwarded reaction to gobridge via sse",
+        conv=conv_id, reaction_ota=reaction_ota_uuid, clients_notified=notified)
+
+    return True
+
+
 def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str) -> bool:
+    """
+    Forward inbound message to either:
+    - Maubot webhook (maubot mode) - pushes via HTTP POST
+    - SSE stream (gobridge mode) - pushes to connected Go bridge clients
+    """
+    # In gobridge mode, push event via SSE
+    if BRIDGE_MODE == "gobridge":
+        return _forward_to_gobridge(r, delivery_id)
+
+    # Maubot mode - original behavior
     if not MAUBOT_WEBHOOK_URL:
         log("WARN", "MAUBOT_WEBHOOK_URL not set; cannot forward", delivery_id=delivery_id)
         note_delivery_error(delivery_id, "MAUBOT_WEBHOOK_URL not set")
@@ -2027,6 +2272,18 @@ def forward_to_maubot(con: sqlite3.Connection, r: sqlite3.Row, delivery_id: str)
 
 
 def forward_reaction_to_maubot(conv_id: str, reaction_ota_uuid: str, target_ota_uuid: str, emoji: str, operation: int, reaction_sort_time: Optional[int]) -> bool:
+    """
+    Forward inbound reaction to either:
+    - Maubot webhook (maubot mode)
+    - SSE stream (gobridge mode)
+    """
+    # In gobridge mode, push event via SSE
+    if BRIDGE_MODE == "gobridge":
+        return _forward_reaction_to_gobridge(
+            conv_id, reaction_ota_uuid, target_ota_uuid, emoji, operation, int(reaction_sort_time or 0)
+        )
+
+    # Maubot mode - original behavior
     if not MAUBOT_WEBHOOK_URL:
         return False
 
@@ -2581,13 +2838,212 @@ def _ack_any_delivery(delivery_id: str) -> bool:
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "garmin-bridge/2.6"
+    server_version = "garmin-bridge/3.0"
 
     def do_GET(self):  # noqa: N802
         path, qs = _parse_query(self.path)
 
         if path == "/healthz":
-            return _send(self, 200, {"ok": True})
+            return _send(self, 200, {"ok": True, "mode": BRIDGE_MODE})
+
+        # ---- Go Bridge API (bridgev2 compatible) ----
+
+        # Capabilities endpoint - describe what this network supports
+        if path == "/capabilities":
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+            return _send(self, 200, {
+                "ok": True,
+                "network": "garmin",
+                "name": "Garmin Messenger",
+                "capabilities": {
+                    "disappearing_messages": False,
+                    "reactions": True,
+                    "replies": False,
+                    "edits": False,
+                    "deletes": False,
+                    "read_receipts": False,
+                    "typing_notifications": False,
+                    "presence": False,
+                    "captions": False,
+                    "location_messages": True,
+                    "contact_info": False,
+                    "max_text_length": 160,
+                    "media_types": ["image/jpeg", "image/png", "image/avif", "image/webp", "image/gif", "audio/ogg", "audio/mp4", "video/mp4"],
+                },
+            })
+
+        # Login/verify endpoint - check if connection is working
+        if path == "/login/verify":
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+            try:
+                with garmin_db_conn() as con:
+                    r = con.execute("SELECT COUNT(*) as cnt FROM conversation").fetchone()
+                    conv_count = int(r["cnt"]) if r else 0
+                # Check ADB connectivity
+                p = adb("devices", timeout=10)
+                adb_ok = p.returncode == 0 and b"device" in (p.stdout or b"")
+                return _send(self, 200, {
+                    "ok": True,
+                    "logged_in": True,
+                    "user_id": GARMIN_USER_ID or "garmin_user",
+                    "conversation_count": conv_count,
+                    "adb_connected": adb_ok,
+                    "bridge_mode": BRIDGE_MODE,
+                })
+            except Exception as e:
+                return _send(self, 200, {
+                    "ok": False,
+                    "logged_in": False,
+                    "error": str(e)[:200],
+                })
+
+        # SSE Event Stream - Go bridge subscribes to receive events
+        if path == "/events/stream":
+            if not _auth_ok(dict(self.headers)):
+                self.send_response(401)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"Unauthorized")
+                return
+
+            # Set up SSE response
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # Disable nginx buffering
+            self.end_headers()
+
+            client_id, event_queue = _sse_broadcaster.subscribe()
+
+            try:
+                # Send initial connection event
+                init_event = {
+                    "type": "connected",
+                    "client_id": client_id,
+                    "timestamp": int(time.time()),
+                    "bridge_mode": BRIDGE_MODE,
+                }
+                self.wfile.write(f"event: connected\ndata: {json.dumps(init_event)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+                # Keep-alive loop - send events as they arrive
+                while True:
+                    try:
+                        # Wait for event with timeout (for keep-alive)
+                        event = event_queue.get(timeout=30.0)
+                        event_type = event.get("type", "message")
+                        data = json.dumps(event, ensure_ascii=False)
+                        self.wfile.write(f"event: {event_type}\ndata: {data}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except queue.Empty:
+                        # Send keep-alive comment
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                log("INFO", "sse client disconnected", client_id=client_id)
+            finally:
+                _sse_broadcaster.unsubscribe(client_id)
+            return
+
+        # Media download endpoint - Go bridge fetches media files
+        if path.startswith("/media/"):
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+
+            attachment_id = path.split("/media/", 1)[1].strip()
+            if not attachment_id:
+                return _send(self, 400, {"ok": False, "error": "attachment_id required"})
+
+            best_path, candidates = resolve_media(ROOT_DIR, attachment_id)
+            if not best_path or not os.path.isfile(best_path):
+                return _send(self, 404, {
+                    "ok": False,
+                    "error": "not found",
+                    "attachment_id": attachment_id,
+                    "candidates_checked": len(candidates),
+                })
+
+            # Check size limit
+            file_size = os.path.getsize(best_path)
+            if MAX_ATTACH_MB and (file_size / (1024 * 1024)) > float(MAX_ATTACH_MB):
+                return _send(self, 413, {
+                    "ok": False,
+                    "error": "file too large",
+                    "size_mb": round(file_size / (1024 * 1024), 2),
+                    "limit_mb": MAX_ATTACH_MB,
+                })
+
+            # Serve the file
+            mime = _guess_mime(best_path)
+            filename = os.path.basename(best_path)
+
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+            self.send_header("X-Attachment-Id", attachment_id)
+            self.end_headers()
+
+            # Stream the file in chunks
+            with open(best_path, "rb") as f:
+                while chunk := f.read(65536):
+                    self.wfile.write(chunk)
+            return
+
+        # Users/contacts endpoint - list known contacts from conversations
+        if path == "/users" or path == "/contacts":
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+
+            contacts: List[Dict[str, Any]] = []
+            try:
+                with garmin_db_conn() as con:
+                    # Get unique senders from messages
+                    rows = con.execute("""
+                        SELECT DISTINCT "from" as addr
+                        FROM message
+                        WHERE "from" IS NOT NULL AND "from" != ''
+                        ORDER BY "from"
+                        LIMIT 1000
+                    """).fetchall()
+                    for r in rows:
+                        addr = str(r["addr"] or "").strip()
+                        if addr:
+                            contacts.append({
+                                "id": addr,
+                                "name": addr,  # Garmin doesn't provide display names
+                                "identifier": addr,
+                            })
+            except Exception as e:
+                log("WARN", "failed to list contacts", err=str(e))
+
+            return _send(self, 200, {"ok": True, "contacts": contacts})
+
+        # Portals/conversations endpoint - list all chats
+        if path == "/portals" or path == "/chats":
+            if not _auth_ok(dict(self.headers)):
+                return _send(self, 401, {"ok": False, "error": "unauthorized"})
+
+            limit = int((qs.get("limit") or ["500"])[0])
+            convs = list_conversations_for_sync(limit=min(2000, max(1, limit)))
+
+            portals = []
+            for c in convs:
+                portals.append({
+                    "portal_key": {
+                        "id": c["internet_conversation_id"],
+                        "receiver": GARMIN_USER_ID,
+                    },
+                    "participants": c.get("participants", []),
+                    "name": None,  # Garmin doesn't have conversation names
+                    "is_dm": len(c.get("participants", [])) <= 2,
+                    "last_message_ts": c.get("last_sort_time", 0),
+                })
+
+            return _send(self, 200, {"ok": True, "portals": portals})
 
         # Lookup mapping for a Garmin message ota_uuid -> Matrix event
         if path == "/matrix/lookup":
@@ -2742,6 +3198,109 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return _send(self, 400, {"ok": False, "error": "delivery_id or ota_uuid required"})
             ok = _ack_any_delivery(delivery_id)
             return _send(self, 200 if ok else 404, {"ok": bool(ok)})
+
+        # ---- Go Bridge API (bridgev2 compatible) ----
+
+        # Send message endpoint - bridgev2 style
+        if self.path == "/send":
+            portal_key = body.get("portal_key") or {}
+            portal_id = str(portal_key.get("id") or body.get("portal_id") or body.get("internet_conversation_id") or "").strip()
+            content = body.get("content") or {}
+            msgtype = str(content.get("msgtype") or "m.text")
+            text = str(content.get("body") or body.get("text") or "")
+            event_id = str(body.get("event_id") or body.get("matrix_event_id") or "")
+            room_id = str(body.get("room_id") or body.get("matrix_room_id") or "")
+
+            if not text:
+                return _send(self, 400, {"ok": False, "error": "content.body or text required"})
+
+            if not room_id or not event_id:
+                return _send(self, 400, {"ok": False, "error": "room_id and event_id required"})
+
+            # Determine if this is a new thread or existing
+            if portal_id:
+                # Existing conversation
+                job = {
+                    "matrix_room_id": room_id,
+                    "matrix_event_id": event_id,
+                    "internet_conversation_id": portal_id,
+                    "kind": "text",
+                    "text": text,
+                }
+            else:
+                # New conversation - need recipients
+                recipients = body.get("recipients") or []
+                if not recipients:
+                    return _send(self, 400, {"ok": False, "error": "portal_key.id or recipients required"})
+                job = {
+                    "matrix_room_id": room_id,
+                    "matrix_event_id": event_id,
+                    "kind": "new_thread",
+                    "text": text,
+                    "recipients_json": json.dumps([str(r) for r in recipients]),
+                }
+
+            jid = enqueue_outbound(job)
+
+            # For new threads, wait for the conversation ID
+            result: Dict[str, Any] = {"ok": True, "job_id": jid, "status": "queued"}
+            if job["kind"] == "new_thread" and int(OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC) > 0:
+                deadline = time.time() + int(OUTBOUND_ENQUEUE_WAIT_NEWTHREAD_SEC)
+                while time.time() < deadline:
+                    res = get_job_result(jid)
+                    if res:
+                        if res.get("internet_conversation_id"):
+                            result["portal_id"] = res["internet_conversation_id"]
+                            result["message_id"] = res.get("ota_uuid")
+                            result["status"] = "sent"
+                            break
+                    time.sleep(0.25)
+
+            return _send(self, 200, result)
+
+        # Send media endpoint - Go bridge uploads media for outbound
+        if self.path == "/send/media":
+            # For media, the Go bridge will POST with the file
+            # This is a placeholder - Garmin Messenger may not support sending media via ADB
+            portal_id = str(body.get("portal_id") or body.get("internet_conversation_id") or "").strip()
+            event_id = str(body.get("event_id") or body.get("matrix_event_id") or "")
+            room_id = str(body.get("room_id") or body.get("matrix_room_id") or "")
+            caption = str(body.get("caption") or body.get("text") or "")
+
+            # Check if we have the file data
+            file_b64 = body.get("file_b64") or body.get("data_b64")
+            filename = body.get("filename") or "media"
+            mimetype = body.get("mimetype") or body.get("mime_type") or "application/octet-stream"
+
+            if not file_b64:
+                return _send(self, 400, {"ok": False, "error": "file_b64 required"})
+
+            if not room_id or not event_id:
+                return _send(self, 400, {"ok": False, "error": "room_id and event_id required"})
+
+            # Note: Garmin Messenger via ADB doesn't easily support media sending
+            # For now, we'll just send the caption as text if provided
+            if caption:
+                job = {
+                    "matrix_room_id": room_id,
+                    "matrix_event_id": event_id,
+                    "internet_conversation_id": portal_id,
+                    "kind": "text",
+                    "text": f"[Media: {filename}] {caption}".strip(),
+                }
+                jid = enqueue_outbound(job)
+                return _send(self, 200, {
+                    "ok": True,
+                    "job_id": jid,
+                    "status": "queued",
+                    "note": "Media sending not supported; caption sent as text",
+                })
+
+            return _send(self, 501, {
+                "ok": False,
+                "error": "Media sending not implemented for Garmin Messenger",
+                "note": "Garmin Messenger ADB automation does not support media attachments",
+            })
 
         return _send(self, 404, {"ok": False, "error": "not found"})
 

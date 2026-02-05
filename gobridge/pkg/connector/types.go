@@ -1,5 +1,12 @@
 package connector
 
+// UserLoginMetadata stores Garmin login credentials in the database.
+type UserLoginMetadata struct {
+	BackendURL string `json:"backend_url"`
+	AuthToken  string `json:"auth_token"`
+	UserID     string `json:"user_id"`
+}
+
 // PortalKey identifies a chat/conversation.
 type PortalKey struct {
 	ID       string `json:"id"`

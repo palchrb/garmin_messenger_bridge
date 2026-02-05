@@ -5,6 +5,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 // GarminLogin implements bridgev2.LoginProcess for Garmin authentication.
@@ -30,20 +31,20 @@ func (gl *GarminLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
-					Type:        bridgev2.LoginInputFieldTypeText,
+					Type:        bridgev2.LoginInputFieldTypeURL,
 					ID:          "backend_url",
 					Name:        "Backend URL",
 					Description: "URL of the Python backend API (e.g., http://localhost:8808)",
 					Pattern:     `^https?://.+`,
 				},
 				{
-					Type:        bridgev2.LoginInputFieldTypePassword,
+					Type:        bridgev2.LoginInputFieldTypeToken,
 					ID:          "auth_token",
 					Name:        "Auth Token",
 					Description: "Bearer token for authenticating with the backend (HTTP_TOKEN env var)",
 				},
 				{
-					Type:        bridgev2.LoginInputFieldTypeText,
+					Type:        bridgev2.LoginInputFieldTypeUsername,
 					ID:          "user_id",
 					Name:        "Garmin User ID",
 					Description: "Your Garmin identifier (phone number or email)",
@@ -75,20 +76,20 @@ func (gl *GarminLogin) SubmitUserInput(ctx context.Context, input map[string]str
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{
 					{
-						Type:        bridgev2.LoginInputFieldTypeText,
+						Type:        bridgev2.LoginInputFieldTypeURL,
 						ID:          "backend_url",
 						Name:        "Backend URL",
 						Description: "URL of the Python backend API",
 						Pattern:     `^https?://.+`,
 					},
 					{
-						Type:        bridgev2.LoginInputFieldTypePassword,
+						Type:        bridgev2.LoginInputFieldTypeToken,
 						ID:          "auth_token",
 						Name:        "Auth Token",
 						Description: "Bearer token for authenticating with the backend",
 					},
 					{
-						Type:        bridgev2.LoginInputFieldTypeText,
+						Type:        bridgev2.LoginInputFieldTypeUsername,
 						ID:          "user_id",
 						Name:        "Garmin User ID",
 						Description: "Your Garmin identifier",
@@ -98,16 +99,16 @@ func (gl *GarminLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		}, nil
 	}
 
-	// Success - create the user login
+	// Success - let the bridge framework create the UserLogin
+	// We store the metadata in the connector config for now
+	// It will be loaded via LoadUserLogin when the bridge starts up next time
+
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,
 		StepID:       "complete",
 		Instructions: "Successfully connected to Garmin Messenger bridge!",
 		CompleteParams: &bridgev2.LoginCompleteParams{
-			UserLoginID: MakeUserID(userID),
-			UserLogin: &bridgev2.UserLogin{
-				ID: MakeUserID(userID),
-			},
+			UserLoginID: networkid.UserLoginID(userID),
 		},
 	}, nil
 }

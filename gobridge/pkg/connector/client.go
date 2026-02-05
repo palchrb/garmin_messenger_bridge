@@ -7,7 +7,10 @@ import (
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/event"
 )
 
 // GarminClient implements bridgev2.NetworkAPI for a logged-in Garmin user.
@@ -17,15 +20,27 @@ type GarminClient struct {
 	log       zerolog.Logger
 }
 
-// Ensure GarminClient implements NetworkAPI
+// Ensure GarminClient implements NetworkAPI and IdentifierResolvingNetworkAPI
 var _ bridgev2.NetworkAPI = (*GarminClient)(nil)
+var _ bridgev2.IdentifierResolvingNetworkAPI = (*GarminClient)(nil)
 
 // Connect establishes the connection (no-op for Garmin as backend handles this).
-func (gc *GarminClient) Connect(ctx context.Context) error {
+func (gc *GarminClient) Connect(ctx context.Context) {
 	gc.log.Info().Msg("Client connecting")
 	// The Python backend maintains the actual Garmin connection
 	// We just verify it's accessible
-	return gc.connector.verifyBackend(ctx)
+	if err := gc.connector.verifyBackend(ctx); err != nil {
+		gc.log.Error().Err(err).Msg("Failed to verify backend connection")
+		gc.userLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateUnknownError,
+			Error:      "garmin-backend-error",
+			Message:    err.Error(),
+		})
+		return
+	}
+	gc.userLogin.BridgeState.Send(status.BridgeState{
+		StateEvent: status.StateConnected,
+	})
 }
 
 // Disconnect closes the connection.
@@ -111,45 +126,68 @@ func (gc *GarminClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.M
 	}
 
 	return &bridgev2.MatrixMessageResponse{
-		DB: &bridgev2.DBMessage{
+		DB: &database.Message{
 			ID: MakeMessageID(messageID),
 		},
 	}, nil
 }
 
-// HandleMatrixEdit handles an edit from Matrix.
-func (gc *GarminClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
-	gc.log.Warn().Msg("Edit not supported by Garmin")
-	return fmt.Errorf("edits not supported")
+
+// ResolveIdentifier looks up a Garmin user by their identifier (phone or email).
+// This is used to start new DM chats.
+func (gc *GarminClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
+	gc.log.Info().Str("identifier", identifier).Bool("create_chat", createChat).Msg("Resolving identifier")
+
+	// For Garmin, we can create a DM with any valid identifier
+	// The actual validation happens when the message is sent
+	userID := MakeUserID(identifier)
+
+	resp := &bridgev2.ResolveIdentifierResponse{
+		UserID: userID,
+		UserInfo: &bridgev2.UserInfo{
+			Name:        &identifier,
+			Identifiers: []string{identifier},
+		},
+	}
+
+	if createChat {
+		// Create a portal ID based on the remote user's ID
+		portalID := MakePortalID(identifier)
+		resp.Chat = &bridgev2.CreateChatResponse{
+			PortalKey: networkid.PortalKey{
+				ID:       portalID,
+				Receiver: MakeUserLoginID(gc.connector.config.UserID),
+			},
+			PortalInfo: &bridgev2.ChatInfo{
+				Members: &bridgev2.ChatMemberList{
+					IsFull:           true,
+					TotalMemberCount: 2,
+					Members: []bridgev2.ChatMember{
+						{
+							EventSender: bridgev2.EventSender{
+								IsFromMe: true,
+								Sender:   MakeUserID(gc.connector.config.UserID),
+							},
+						},
+						{
+							EventSender: bridgev2.EventSender{
+								Sender: userID,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	return resp, nil
 }
 
-// HandleMatrixMessageRemove handles a message removal from Matrix.
-func (gc *GarminClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error {
-	gc.log.Warn().Msg("Message removal not supported by Garmin")
-	return fmt.Errorf("message removal not supported")
-}
-
-// HandleMatrixReaction handles a reaction from Matrix.
-func (gc *GarminClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*bridgev2.DBReaction, error) {
-	gc.log.Warn().Msg("Reactions from Matrix not yet implemented")
-	// TODO: Implement reaction sending via backend
-	return nil, fmt.Errorf("reactions not implemented")
-}
-
-// HandleMatrixReactionRemove handles a reaction removal from Matrix.
-func (gc *GarminClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2.MatrixReactionRemove) error {
-	gc.log.Warn().Msg("Reaction removal not supported by Garmin")
-	return fmt.Errorf("reaction removal not supported")
-}
-
-// HandleMatrixReadReceipt handles a read receipt from Matrix.
-func (gc *GarminClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
-	// Garmin doesn't support read receipts
-	return nil
-}
-
-// HandleMatrixTyping handles typing notifications from Matrix.
-func (gc *GarminClient) HandleMatrixTyping(ctx context.Context, typing *bridgev2.MatrixTyping) error {
-	// Garmin doesn't support typing notifications
-	return nil
+// GetCapabilities returns capabilities specific to this login.
+func (gc *GarminClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
+	return &event.RoomFeatures{
+		LocationMessage:  event.CapLevelFullySupported,
+		Reaction:         event.CapLevelFullySupported,
+		ReadReceipts:     false,
+	}
 }

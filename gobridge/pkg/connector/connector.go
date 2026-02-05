@@ -22,8 +22,12 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/configupgrade"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/event"
 )
 
 // GarminConnector implements bridgev2.NetworkConnector for Garmin Messenger.
@@ -38,6 +42,10 @@ type GarminConnector struct {
 	// SSE connection management
 	sseCancel context.CancelFunc
 	sseMu     sync.Mutex
+
+	// Active user login (we only support single-user for now)
+	activeLogin   *bridgev2.UserLogin
+	activeLoginMu sync.RWMutex
 }
 
 // Config holds the connector configuration.
@@ -111,18 +119,51 @@ func (gc *GarminConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilitie
 	}
 }
 
-// GetConfig returns the connector configuration.
-func (gc *GarminConnector) GetConfig() any {
-	return gc.config
+// GetConfig returns the config parts for the bridge.
+func (gc *GarminConnector) GetConfig() (example string, data any, upgrader configupgrade.Upgrader) {
+	return exampleConfig, gc.config, configupgrade.NoopUpgrader
 }
 
-// GetDBMetaTypes returns database meta types (none needed for this connector).
-func (gc *GarminConnector) GetDBMetaTypes() bridgev2.DBMetaTypes {
-	return bridgev2.DBMetaTypes{}
+// Example config for the connector.
+const exampleConfig = `
+# Garmin Messenger bridge configuration
+garmin:
+    # URL of the Python backend API
+    backend_url: http://localhost:8808
+    # Bearer token for authenticating with the backend
+    auth_token: ""
+    # Your Garmin user identifier (phone number or email)
+    user_id: ""
+    # How long to wait before reconnecting SSE on disconnect
+    reconnect_interval: 5s
+`
+
+// GetDBMetaTypes returns database meta types for persisting login metadata.
+func (gc *GarminConnector) GetDBMetaTypes() database.MetaTypes {
+	return database.MetaTypes{
+		UserLogin: func() any { return &UserLoginMetadata{} },
+	}
+}
+
+// GetBridgeInfoVersion returns version numbers for bridge info and room capabilities.
+func (gc *GarminConnector) GetBridgeInfoVersion() (info, capabilities int) {
+	return 1, 1
 }
 
 // LoadUserLogin loads a user login from the database.
 func (gc *GarminConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
+	// Load credentials from metadata
+	meta, ok := login.Metadata.(*UserLoginMetadata)
+	if ok && meta != nil {
+		gc.config.BackendURL = meta.BackendURL
+		gc.config.AuthToken = meta.AuthToken
+		gc.config.UserID = meta.UserID
+		gc.log.Info().
+			Str("backend_url", meta.BackendURL).
+			Str("user_id", meta.UserID).
+			Msg("Loaded credentials from login metadata")
+	}
+
 	// Create a GarminClient for this login
 	client := &GarminClient{
 		connector: gc,
@@ -130,7 +171,20 @@ func (gc *GarminConnector) LoadUserLogin(ctx context.Context, login *bridgev2.Us
 		log:       gc.log.With().Str("user", string(login.ID)).Logger(),
 	}
 	login.Client = client
+
+	// Track this as the active login
+	gc.activeLoginMu.Lock()
+	gc.activeLogin = login
+	gc.activeLoginMu.Unlock()
+
 	return nil
+}
+
+// getUserLogin returns the current active user login.
+func (gc *GarminConnector) getUserLogin() *bridgev2.UserLogin {
+	gc.activeLoginMu.RLock()
+	defer gc.activeLoginMu.RUnlock()
+	return gc.activeLogin
 }
 
 // GetLoginFlows returns the available login flows.
@@ -343,30 +397,132 @@ func (gc *GarminConnector) handleSSEEvent(ctx context.Context, eventType, data s
 }
 
 // handleMessageEvent processes an incoming message event.
-func (gc *GarminConnector) handleMessageEvent(ctx context.Context, event *MessageEvent) {
+func (gc *GarminConnector) handleMessageEvent(ctx context.Context, evt *MessageEvent) {
 	gc.log.Info().
-		Str("portal_id", event.PortalKey.ID).
-		Str("message_id", event.ID).
-		Bool("is_from_me", event.Sender.IsFromMe).
+		Str("portal_id", evt.PortalKey.ID).
+		Str("message_id", evt.ID).
+		Bool("is_from_me", evt.Sender.IsFromMe).
 		Msg("Processing message event")
 
-	// TODO: Queue this event to the bridge for processing
-	// This would involve:
-	// 1. Finding or creating the portal (room)
-	// 2. Finding or creating the ghost user (sender)
-	// 3. Creating the Matrix event
-	// 4. If media is present and ready, fetching it via GET /media/{id}
+	// Get the user login to queue the event
+	userLogin := gc.getUserLogin()
+	if userLogin == nil {
+		gc.log.Warn().Msg("No user login found, cannot process message")
+		return
+	}
+
+	// Determine sender info
+	var sender bridgev2.EventSender
+	if evt.Sender.IsFromMe {
+		sender = bridgev2.EventSender{
+			IsFromMe: true,
+			Sender:   MakeUserID(gc.config.UserID),
+		}
+	} else {
+		sender = bridgev2.EventSender{
+			IsFromMe: false,
+			Sender:   MakeUserID(evt.Sender.ID),
+		}
+	}
+
+	// Build message content
+	var msgType event.MessageType
+	var content *event.MessageEventContent
+
+	switch evt.Content.MsgType {
+	case "m.text":
+		msgType = event.MsgText
+		content = &event.MessageEventContent{
+			MsgType: msgType,
+			Body:    evt.Content.Body,
+		}
+	case "m.location":
+		msgType = event.MsgLocation
+		content = &event.MessageEventContent{
+			MsgType: msgType,
+			Body:    evt.Content.Body,
+			GeoURI:  evt.Content.GeoURI,
+		}
+	default:
+		msgType = event.MsgText
+		content = &event.MessageEventContent{
+			MsgType: msgType,
+			Body:    evt.Content.Body,
+		}
+	}
+
+	// Create the remote event
+	remoteEvt := &simplevent.Message[*event.MessageEventContent]{
+		EventMeta: simplevent.EventMeta{
+			Type: bridgev2.RemoteEventMessage,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.
+					Str("portal_id", evt.PortalKey.ID).
+					Str("message_id", evt.ID).
+					Str("sender_id", evt.Sender.ID)
+			},
+			PortalKey: networkid.PortalKey{
+				ID:       MakePortalID(evt.PortalKey.ID),
+				Receiver: MakeUserLoginID(evt.PortalKey.Receiver),
+			},
+			Sender:       sender,
+			CreatePortal: true,
+			Timestamp:    time.Unix(evt.Timestamp, 0),
+		},
+		ID:   MakeMessageID(evt.ID),
+		Data: content,
+	}
+
+	// If there's media, we'll need to handle it separately
+	// For now, queue the text message
+	gc.bridge.QueueRemoteEvent(userLogin, remoteEvt)
 }
 
 // handleReactionEvent processes an incoming reaction event.
-func (gc *GarminConnector) handleReactionEvent(ctx context.Context, event *ReactionEvent) {
+func (gc *GarminConnector) handleReactionEvent(ctx context.Context, evt *ReactionEvent) {
 	gc.log.Info().
-		Str("portal_id", event.PortalKey.ID).
-		Str("reaction_id", event.ID).
-		Str("emoji", event.Emoji).
+		Str("portal_id", evt.PortalKey.ID).
+		Str("reaction_id", evt.ID).
+		Str("emoji", evt.Emoji).
+		Str("operation", evt.Operation).
 		Msg("Processing reaction event")
 
-	// TODO: Queue this event to the bridge for processing
+	userLogin := gc.getUserLogin()
+	if userLogin == nil {
+		gc.log.Warn().Msg("No user login found, cannot process reaction")
+		return
+	}
+
+	portalKey := networkid.PortalKey{
+		ID:       MakePortalID(evt.PortalKey.ID),
+		Receiver: MakeUserLoginID(evt.PortalKey.Receiver),
+	}
+
+	eventType := bridgev2.RemoteEventReaction
+	if evt.Operation == "remove" {
+		eventType = bridgev2.RemoteEventReactionRemove
+	}
+
+	remoteEvt := &simplevent.Reaction{
+		EventMeta: simplevent.EventMeta{
+			Type: eventType,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.
+					Str("portal_id", evt.PortalKey.ID).
+					Str("reaction_id", evt.ID).
+					Str("target_id", evt.TargetID)
+			},
+			PortalKey: portalKey,
+			Sender: bridgev2.EventSender{
+				IsFromMe: false,
+				Sender:   MakeUserID(evt.PortalKey.Receiver),
+			},
+			Timestamp: time.Unix(evt.Timestamp, 0),
+		},
+		TargetMessage: MakeMessageID(evt.TargetID),
+		Emoji:         evt.Emoji,
+	}
+	gc.bridge.QueueRemoteEvent(userLogin, remoteEvt)
 }
 
 // handleMediaReadyEvent processes a media_ready notification.
@@ -450,6 +606,11 @@ func (gc *GarminConnector) SendMessage(ctx context.Context, portalID, text, even
 // MakeUserID creates a network user ID from a Garmin address (phone/email).
 func MakeUserID(address string) networkid.UserID {
 	return networkid.UserID(address)
+}
+
+// MakeUserLoginID creates a network user login ID from a Garmin address (phone/email).
+func MakeUserLoginID(address string) networkid.UserLoginID {
+	return networkid.UserLoginID(address)
 }
 
 // MakePortalID creates a network portal ID from a conversation ID.
